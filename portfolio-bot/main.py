@@ -60,10 +60,29 @@ import yfinance as yf
 from flask import Flask
 
 # Hard trade rules (always override fundamentals)
-STOP_LOSS_PCT = -7.0              # forced SELL at -7% (capital protection)
+STOP_LOSS_PCT = -7.0              # default trailing stop (normal volatility)
+STOP_LOSS_PCT_HIGH_VOL = -10.0    # ATR > 4% — wider stop avoids whipsaw
+STOP_LOSS_PCT_LOW_VOL = -5.0      # ATR < 2% — tighter stop for low-vol names
+WATCH_TIGHTENED_STOP_PCT = -3.0   # score 35-49 → tighten to -3% from current
+ATR_HIGH_VOL_THRESHOLD = 4.0      # ATR% above this → high-vol bucket
+ATR_LOW_VOL_THRESHOLD = 2.0       # ATR% below this → low-vol bucket
+ATR_RECALC_DAYS = 7               # weekly ATR refresh in /portfolio
 ABOVE_TARGET_FRACTION = 1.00      # forced SELL when price ≥ analyst target
 APPROACH_TARGET_FRACTION = 0.90   # soft alert when price ≥ 90% of target
 LOW_TARGET_FRACTION = 0.70        # info: price ≤ 70% of target → big upside
+
+# Sector concentration cap (per spec: max 3 positions per sector).
+MAX_POSITIONS_PER_SECTOR = 3
+
+# Cash management — initial cash, idle threshold, treasury suggestion.
+INITIAL_CASH = 5000.0
+IDLE_CASH_THRESHOLD = 500.0
+CASH_FILE = "cash.json"
+
+# Immediate rescan-after-exit: wait this long before scanning for a
+# replacement (lets the user see the sell alert first, and lets the
+# market settle a bit if the exit was triggered intraday).
+RESCAN_DELAY_SECONDS = 300        # 5 minutes
 
 
 def _status_emoji(pl_pct):
@@ -166,6 +185,205 @@ def save_json(path, data):
 
 def load_portfolio():
     return load_json(PORTFOLIO_FILE, {})
+
+
+# ---------------------------------------------------------------------------
+# Cash bookkeeping (cash.json)
+# ---------------------------------------------------------------------------
+_cash_lock = threading.Lock()
+
+
+def _save_cash_unlocked(data):
+    """Atomic write — assumes _cash_lock is already held."""
+    tmp = CASH_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, CASH_FILE)
+
+
+def load_cash():
+    """Return ``{"cash": float}``. Bootstraps cash.json on first call by
+    deducting the cost of every existing position from the seed
+    ``INITIAL_CASH`` ($5000) so the user's existing portfolio has a
+    sensible starting balance.
+    """
+    with _cash_lock:
+        if not os.path.exists(CASH_FILE):
+            try:
+                portfolio = load_portfolio()
+                invested = sum(
+                    float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+                    for p in portfolio.values()
+                )
+            except Exception:
+                invested = 0.0
+            data = {"cash": round(max(INITIAL_CASH - invested, 0.0), 2)}
+            _save_cash_unlocked(data)
+            return data
+        try:
+            return load_json(CASH_FILE, {"cash": 0.0})
+        except Exception:
+            return {"cash": 0.0}
+
+
+def save_cash(data):
+    with _cash_lock:
+        _save_cash_unlocked(data)
+
+
+def adjust_cash(delta):
+    """Atomically add ``delta`` (can be negative) to the cash balance.
+
+    Returns the new balance. Guarded by ``_cash_lock`` so concurrent
+    /buy and /sell can't race.
+    """
+    with _cash_lock:
+        if not os.path.exists(CASH_FILE):
+            # Bootstrap inside the lock so we never double-init.
+            try:
+                portfolio = load_portfolio()
+                invested = sum(
+                    float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+                    for p in portfolio.values()
+                )
+            except Exception:
+                invested = 0.0
+            data = {"cash": round(max(INITIAL_CASH - invested, 0.0), 2)}
+        else:
+            try:
+                data = load_json(CASH_FILE, {"cash": 0.0})
+            except Exception:
+                data = {"cash": 0.0}
+        new_cash = round(float(data.get("cash", 0.0)) + float(delta), 2)
+        data["cash"] = new_cash
+        _save_cash_unlocked(data)
+        return new_cash
+
+
+# ---------------------------------------------------------------------------
+# Chunked Telegram sender — splits messages > 4000 chars on \n boundaries.
+# ---------------------------------------------------------------------------
+def _send_chunked(text, chat_id, parse_mode="Markdown", max_chars=4000):
+    """Send a (possibly long) message, splitting into ≤max_chars chunks at
+    line boundaries when needed. Telegram's hard cap is 4096 chars — we
+    target 4000 to leave headroom for parser quirks. Lines longer than
+    max_chars are hard-split mid-line.
+    """
+    if text is None:
+        return
+    if len(text) <= max_chars:
+        send_telegram(text, chat_id, parse_mode=parse_mode)
+        return
+
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.split("\n"):
+        if len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current, current_len = [], 0
+            for i in range(0, len(line), max_chars):
+                chunks.append(line[i:i + max_chars])
+            continue
+        added = len(line) + (1 if current else 0)
+        if current_len + added > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += added
+    if current:
+        chunks.append("\n".join(current))
+
+    for c in chunks:
+        send_telegram(c, chat_id, parse_mode=parse_mode)
+
+
+# ---------------------------------------------------------------------------
+# Volatility (ATR) + trailing stop helpers
+# ---------------------------------------------------------------------------
+def calculate_atr(ticker, hist=None, period=14):
+    """14-day Average True Range as a percentage of current price.
+
+    True Range for a bar = max(high-low, |high-prev_close|, |low-prev_close|).
+    ATR% = (mean of last `period` TRs) / current_close * 100.
+
+    Returns ``(atr_pct, current_close)`` or ``(None, None)`` on failure.
+    Accepts a pre-fetched ``hist`` DataFrame (>= period+1 rows) so callers
+    that already have history (e.g. /portfolio) don't re-pay the
+    yfinance round-trip.
+    """
+    try:
+        if hist is None:
+            hist = yf.Ticker(ticker).history(period="2mo")
+        if hist is None or len(hist) < period + 1:
+            return None, None
+        # Walk the last (period+1) bars in plain Python so we don't need
+        # a hard pandas dependency at the module top — yfinance ships
+        # pandas under the hood but importing it here would be one more
+        # surface to break on environment changes.
+        h = hist.tail(period + 1)
+        highs = h["High"].tolist()
+        lows = h["Low"].tolist()
+        closes = h["Close"].tolist()
+        true_ranges = []
+        for i in range(1, len(closes)):
+            hi = float(highs[i])
+            lo = float(lows[i])
+            prev = float(closes[i - 1])
+            tr = max(hi - lo, abs(hi - prev), abs(lo - prev))
+            true_ranges.append(tr)
+        if not true_ranges:
+            return None, None
+        atr = sum(true_ranges) / len(true_ranges)
+        current = float(closes[-1])
+        if current <= 0:
+            return None, None
+        return round((atr / current) * 100.0, 2), current
+    except Exception as exc:
+        print(f"[atr {ticker}] failed: {exc}")
+        return None, None
+
+
+def get_atr_stop_pct(atr_pct):
+    """Return the trailing-stop percentage (negative) for the given
+    ATR%: -10 for high-vol, -5 for low-vol, -7 default.
+    """
+    if atr_pct is None:
+        return STOP_LOSS_PCT
+    if atr_pct > ATR_HIGH_VOL_THRESHOLD:
+        return STOP_LOSS_PCT_HIGH_VOL
+    if atr_pct < ATR_LOW_VOL_THRESHOLD:
+        return STOP_LOSS_PCT_LOW_VOL
+    return STOP_LOSS_PCT
+
+
+def compute_trailing_stop(pos, current_price=None):
+    """Return ``(stop_price, mode)`` for an owned position.
+
+    ``mode`` is one of:
+      - ``"tightened"`` — score is in the watch zone; ``pos`` carries a
+        snapshot ``tightened_stop_price`` taken at the moment the
+        position transitioned into the watch zone (-3% from current).
+      - ``"trailing"`` — normal mode; stop = peak_price × (1 + atr_stop_pct/100).
+
+    The peak / atr_stop_pct fields are backfilled by callers that have
+    fresh data; for a position missing them we fall back gracefully to
+    entry_price + the default -7% stop so legacy positions still work.
+    """
+    if pos.get("tightened_stop") and pos.get("tightened_stop_price"):
+        return float(pos["tightened_stop_price"]), "tightened"
+
+    entry = float(pos.get("entry_price", 0) or 0)
+    peak = float(pos.get("peak_price", entry) or entry)
+    atr_stop_pct = float(pos.get("atr_stop_pct", STOP_LOSS_PCT))
+    factor = 1.0 + (atr_stop_pct / 100.0)
+    stop = peak * factor if peak > 0 else 0.0
+    return stop, "trailing"
 
 
 def save_portfolio(portfolio):
@@ -1075,22 +1293,47 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
         details["rs_vs_spy"] = round(rs * 100, 1)
         details["spy_ret_4w"] = round(spy_ret_4w * 100, 1)
 
-        # ── Volume confirmation (15 pts) ────────────────────────────────
-        last20 = hist.tail(20)
-        up = last20[last20["Close"] > last20["Open"]]
-        down = last20[last20["Close"] <= last20["Open"]]
-        avg_up_vol = float(up["Volume"].mean()) if len(up) > 0 else 0.0
-        avg_down_vol = float(down["Volume"].mean()) if len(down) > 0 else 0.0
-        if avg_down_vol > 0:
-            vol_ratio = avg_up_vol / avg_down_vol
-            if vol_ratio > 1.5:
-                score += 15
-            elif vol_ratio > 0.8:
-                score += 7
-            details["vol_ratio"] = round(vol_ratio, 2)
-        else:
-            score += 15
-            details["vol_ratio"] = 999.0
+        # ── Volume confirmation via RVOL (15 pts) ───────────────────────
+        # RVOL = today's volume ÷ 20-day average volume. Awards points
+        # only on up days (close > open) — institutional buying is what
+        # we're trying to detect, not panic selling. A high RVOL on a
+        # down day is bearish, so it scores 0.
+        try:
+            last20 = hist.tail(20)
+            avg_vol_20d = float(last20["Volume"].mean()) if len(last20) > 0 else 0.0
+            today_vol = float(hist["Volume"].iloc[-1])
+            today_open = float(hist["Open"].iloc[-1])
+            today_close = float(hist["Close"].iloc[-1])
+            up_day = today_close > today_open
+            if avg_vol_20d > 0:
+                rvol = today_vol / avg_vol_20d
+            else:
+                rvol = 0.0
+
+            vol_score = 0
+            if up_day:
+                if rvol > 2.0:
+                    vol_score = 15
+                elif rvol >= 1.5:
+                    vol_score = 10
+                elif rvol >= 1.0:
+                    vol_score = 7
+            score += vol_score
+
+            details["rvol"] = round(rvol, 2)
+            details["rvol_up_day"] = bool(up_day)
+            details["rvol_score"] = vol_score
+            # Backward-compat: keep the old vol_ratio key populated so
+            # any callers / tests that still reference it don't break —
+            # we now stuff RVOL into it. The new _vol_label inspects the
+            # rvol key first and only falls back to vol_ratio.
+            details["vol_ratio"] = round(rvol, 2)
+        except Exception as exc:
+            print(f"[momentum {ticker}] RVOL calc failed: {exc}")
+            details["rvol"] = None
+            details["rvol_up_day"] = None
+            details["rvol_score"] = 0
+            details["vol_ratio"] = None
 
         # ── News sentiment (20 pts) ─────────────────────────────────────
         if news_articles is None:
@@ -1220,26 +1463,29 @@ def get_momentum_signal(score):
     return "SELL", "🔴"
 
 
-def apply_position_rules(score, current_price, entry_price):
+def apply_position_rules(score, current_price, stop_price):
     """Final SELL/HOLD/BUY rules for an OWNED position.
 
     Per spec — SELL fires if EITHER trigger hits, otherwise the score
     drives the bucket:
 
-      SELL 🔴       if score < 35  OR  current ≤ entry × (1 + STOP/100)
-      STRONG BUY 🟢 if score ≥ 80  AND price above stop loss
-      BUY 🟢        if score ≥ 65  AND price above stop loss
-      HOLD 🟢       if score ≥ 50  AND price above stop loss
-      WATCH 🟡      otherwise (score 35-50, price above stop loss)
+      SELL 🔴       if score < 35  OR  current ≤ stop_price
+      STRONG BUY 🟢 if score ≥ 80  AND price above stop
+      BUY 🟢        if score ≥ 65  AND price above stop
+      HOLD 🟢       if score ≥ 50  AND price above stop
+      WATCH 🟡      otherwise (score 35-50, price above stop)
 
-    Returns ``(signal, color, stop_breached)`` so the caller can show
-    WHICH trigger fired.
+    The caller computes ``stop_price`` via ``compute_trailing_stop``
+    so it transparently handles trailing (peak-based), tightened
+    (-3% from current in the watch zone) and ATR-adjusted (-5/-7/-10)
+    behaviour. Returns ``(signal, color, stop_breached)`` so the caller
+    can show WHICH trigger fired.
     """
-    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)
     stop_breached = (
         current_price is not None
-        and entry_price is not None
-        and current_price <= entry_price * stop_factor
+        and stop_price is not None
+        and stop_price > 0
+        and current_price <= stop_price
     )
 
     # Hard SELL rules — either condition trips it.
@@ -1266,7 +1512,7 @@ def _fallback_reason(signal, score, stop_breached=False):
     if signal == "SELL":
         if stop_breached:
             return (
-                "Stop loss breached (-7% from entry) — exit position to "
+                "Trailing stop loss breached — exit position to "
                 "protect capital."
             )
         return "Momentum broken across price, RS, and news — exit position."
@@ -1288,7 +1534,7 @@ def _format_momentum_for_prompt(records):
         d = r.get("details") or {}
         extras = []
         if r.get("stop_breached"):
-            extras.append("STOP-LOSS BREACHED (-7%)")
+            extras.append("TRAILING STOP BREACHED")
         if r.get("above_target"):
             extras.append("ABOVE ANALYST TARGET (overextended)")
         extras_str = (" | " + " | ".join(extras)) if extras else ""
@@ -1333,10 +1579,10 @@ def _get_quick_reasons(positions_data):
         "short sentence (max 16 words) per ticker explaining why the "
         "given signal is appropriate, citing the SPECIFIC weakest or "
         "strongest momentum component for that ticker.\n\n"
-        "IMPORTANT — when a ticker has the flag 'STOP-LOSS BREACHED', "
-        "the SELL signal is driven by the -7% stop being hit (capital "
+        "IMPORTANT — when a ticker has the flag 'TRAILING STOP BREACHED', "
+        "the SELL signal is driven by the trailing stop being hit (capital "
         "protection), NOT by momentum — your sentence MUST mention the "
-        "stop loss being breached. When a ticker has the flag 'ABOVE "
+        "trailing stop being breached. When a ticker has the flag 'ABOVE "
         "ANALYST TARGET', mention that the stock looks overextended "
         "even if momentum is still strong.\n\n"
         "End each sentence with a period.\n\n"
@@ -1485,7 +1731,7 @@ def run_monthly_screen(chat_id):
             f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
             f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
             f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
-            f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+            f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n"
             f"News: {d.get('news', 'n/a')}\n"
             f"Earnings: "
             f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
@@ -1996,7 +2242,7 @@ def handle_performance(chat_id):
             f"• {r['date']} *{r['ticker']}* — {r.get('signal') or '?'} → "
             f"{result} ({ret_str})"
         )
-    send_telegram("\n".join(lines), chat_id)
+    _send_chunked("\n".join(lines), chat_id)
 
 
 def handle_review(chat_id):
@@ -2037,7 +2283,7 @@ def handle_review(chat_id):
             f"  Rec ${rec_price:.2f} → now {cur_str}  |  {ret_str}\n"
             f"  4w review: {d4_label}  |  8w review: {d8_label}"
         )
-    send_telegram("\n\n".join(lines), chat_id)
+    _send_chunked("\n\n".join(lines), chat_id)
 
 
 # --- Weekly summary (Sunday 08:00 UTC) --------------------------------------
@@ -2156,11 +2402,34 @@ def handle_buy(args, chat_id):
         )
         return
 
-    # Fetch the analyst consensus target right at buy time and store it.
+    # Fetch the analyst consensus target + sector right at buy time.
     fund = get_fundamentals(ticker)
     target = _safe_target((fund or {}).get("targetMeanPrice"))
+    sector_raw = (fund or {}).get("sector")
+    sector = sector_raw.strip() if isinstance(sector_raw, str) else None
 
+    # ── Sector cap (max 3 per sector) ────────────────────────────────
     portfolio = load_portfolio()
+    if sector:
+        same_sector = [
+            t for t, p in portfolio.items()
+            if t != ticker and isinstance(p.get("sector"), str)
+            and p["sector"].strip().lower() == sector.lower()
+        ]
+        if len(same_sector) >= MAX_POSITIONS_PER_SECTOR:
+            send_telegram(
+                f"⚠️ Sector cap reached — already have "
+                f"{len(same_sector)} positions in *{sector}* "
+                f"({', '.join(same_sector)}). "
+                f"Diversify into a different sector.",
+                chat_id,
+            )
+            return
+
+    # ── ATR + ATR-adjusted stop ──────────────────────────────────────
+    atr_pct, _ = calculate_atr(ticker)
+    atr_stop_pct = get_atr_stop_pct(atr_pct)
+
     portfolio[ticker] = {
         "shares": shares,
         "entry_price": price,
@@ -2169,22 +2438,55 @@ def handle_buy(args, chat_id):
         # alert state for the new target-based system
         "approach_alerted": False,
         "above_alerted": False,
+        # New: trailing stop / sector / ATR fields per spec.
+        "peak_price": price,
+        "sector": sector,
+        "atr_pct": atr_pct,
+        "atr_stop_pct": atr_stop_pct,
+        "atr_last_calc": datetime.utcnow().strftime("%Y-%m-%d"),
+        "tightened_stop": False,
     }
     save_portfolio(portfolio)
 
+    # ── Cash deduction ───────────────────────────────────────────────
+    cost = round(shares * price, 2)
+    new_cash = adjust_cash(-cost)
+
+    # ── Confirmation message ─────────────────────────────────────────
+    lines = [f"Added *{ticker}* — {shares} shares @ ${price:.2f}"]
     if target:
         upside = ((target - price) / price) * 100
-        send_telegram(
-            f"Added *{ticker}* — {shares} shares @ ${price:.2f}\n"
-            f"Analyst target: ${target:.2f} ({upside:+.1f}% upside)",
-            chat_id,
+        lines.append(
+            f"Analyst target: ${target:.2f} ({upside:+.1f}% upside)"
         )
     else:
-        send_telegram(
-            f"Added *{ticker}* — {shares} shares @ ${price:.2f}\n"
-            f"_Analyst target unavailable._",
-            chat_id,
+        lines.append("_Analyst target unavailable._")
+    if sector:
+        lines.append(f"Sector: {sector}")
+    if atr_pct is not None:
+        stop_dollar = price * (1.0 + atr_stop_pct / 100.0)
+        lines.append(
+            f"ATR: {atr_pct:.2f}% → trailing stop {atr_stop_pct:.0f}% "
+            f"(${stop_dollar:.2f})"
         )
+        if atr_pct > ATR_HIGH_VOL_THRESHOLD:
+            lines.append(
+                "⚠️ High volatility stock — using wider -10% stop "
+                "to avoid whipsawing"
+            )
+        elif atr_pct < ATR_LOW_VOL_THRESHOLD:
+            lines.append(
+                "Low volatility stock — using tighter -5% stop"
+            )
+    lines.append(
+        f"Cost: ${cost:,.2f} | Cash remaining: ${new_cash:,.2f}"
+    )
+    if new_cash < 0:
+        lines.append(
+            "_⚠️ Cash balance is negative — you've over-allocated. "
+            "Consider tracking actual brokerage cash separately._"
+        )
+    send_telegram("\n".join(lines), chat_id)
 
     # Feedback loop — kick off a momentum analysis on the new position so
     # the /buy decision gets logged like any other recommendation. Runs in
@@ -2287,19 +2589,42 @@ def handle_sell(args, chat_id):
 
     remaining = round(held - sell_qty, 6)
 
+    # ── Cash bookkeeping — credit proceeds at the LATEST price (not
+    # entry) so the cash balance reflects the actual exit value. Falls
+    # back to entry price if a live quote isn't available.
+    exit_price = get_current_price(ticker) or entry
+    proceeds = round(sell_qty * exit_price, 2)
+    new_cash = adjust_cash(proceeds)
+
     if remaining <= 0:
         del portfolio[ticker]
         save_portfolio(portfolio)
         send_telegram(
-            f"Sold {sell_qty} *{ticker}* shares. Position closed.",
+            f"Sold {sell_qty} *{ticker}* shares @ ~${exit_price:.2f}. "
+            f"Position closed.\n"
+            f"Proceeds: ${proceeds:,.2f} | Cash: ${new_cash:,.2f}",
             chat_id,
         )
+
+        # ── Immediate rescan after exit (per spec): wait 5 minutes,
+        # then look for a replacement among the top 100 S&P 500 names
+        # that the user doesn't already hold. Background thread so the
+        # confirmation message returns instantly.
+        def _post_sell_rescan():
+            try:
+                time.sleep(RESCAN_DELAY_SECONDS)
+                find_replacement_after_exit(chat_id, exclude={ticker})
+            except Exception as exc:
+                print(f"[/sell {ticker}] rescan failed: {exc}")
+
+        Thread(target=_post_sell_rescan, daemon=True).start()
     else:
         pos["shares"] = remaining
         save_portfolio(portfolio)
         send_telegram(
-            f"Sold {sell_qty} *{ticker}* shares. "
-            f"Remaining position: {remaining} shares @ ${entry:.2f}",
+            f"Sold {sell_qty} *{ticker}* shares @ ~${exit_price:.2f}. "
+            f"Remaining position: {remaining} shares @ ${entry:.2f}\n"
+            f"Proceeds: ${proceeds:,.2f} | Cash: ${new_cash:,.2f}",
             chat_id,
         )
 
@@ -2336,19 +2661,30 @@ def handle_trim(args, chat_id):
         )
         return
 
+    # Credit proceeds at current price BEFORE removing the position
+    # (parity with /sell so cash.json stays in sync — fix per
+    # architect review).
+    exit_price = get_current_price(ticker) or entry
+    proceeds = round(sell_qty * exit_price, 2)
+    new_cash = adjust_cash(proceeds)
+
     if remaining <= 0:
         del portfolio[ticker]
         save_portfolio(portfolio)
         send_telegram(
-            f"Trimmed *{ticker}* — sold {sell_qty} shares (full position).",
+            f"Trimmed *{ticker}* — sold {sell_qty} shares (full position) "
+            f"@ ${exit_price:.2f} → +${proceeds:.2f}.\n"
+            f"Cash balance: ${new_cash:.2f}",
             chat_id,
         )
     else:
         pos["shares"] = remaining
         save_portfolio(portfolio)
         send_telegram(
-            f"Trimmed *{ticker}* — sold {sell_qty} shares (50%). "
-            f"Remaining position: {remaining} shares @ ${entry:.2f}",
+            f"Trimmed *{ticker}* — sold {sell_qty} shares (50%) "
+            f"@ ${exit_price:.2f} → +${proceeds:.2f}.\n"
+            f"Remaining position: {remaining} shares @ ${entry:.2f}\n"
+            f"Cash balance: ${new_cash:.2f}",
             chat_id,
         )
 
@@ -2358,14 +2694,28 @@ def _fmt_signed_pct(value):
     return "n/a" if value is None else f"{value:+.1f}%"
 
 
-def _vol_label(vol_ratio):
-    """Render the volume ratio with a directional bullish/bearish flag."""
-    if vol_ratio is None:
+def _vol_label(rvol, up_day=None):
+    """Render the relative-volume (RVOL = today / 20-day avg) line.
+
+    `up_day` (optional) lets us call out institutional buying on an
+    up day vs. distribution on a down day. When omitted (legacy
+    callers) we still render the ratio without the directional flag.
+    """
+    if rvol is None:
         return "n/a"
-    if vol_ratio >= 999:
-        return "all-up days (no down days, ↑ Bullish)"
-    arrow = "↑ Bullish" if vol_ratio >= 1.0 else "↓ Bearish"
-    return f"{vol_ratio:.2f}x ({arrow})"
+    if rvol >= 2.0 and up_day:
+        flag = "institutional buying confirmed ✅"
+    elif rvol >= 1.5 and up_day:
+        flag = "above average ↑"
+    elif rvol >= 1.0 and up_day:
+        flag = "above average"
+    elif up_day is False and rvol >= 1.5:
+        flag = "distribution ⚠️ (down day on heavy volume)"
+    elif up_day is False:
+        flag = "down day"
+    else:
+        flag = "below average"
+    return f"RVOL {rvol:.2f}x ({flag})"
 
 
 def _earnings_label(beat, est_rising):
@@ -2402,11 +2752,11 @@ def handle_portfolio(chat_id, scheduled=False):
         )
         return
 
-    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)  # e.g. 0.93
-
     tickers = list(portfolio.keys())
     fundamentals = fetch_fundamentals_bulk(tickers)
     portfolio_dirty = False
+    today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+    transition_alerts = []  # tightened/restored alerts to fire after the report
 
     # Pull 1-day news once for every holding so the momentum scorer can
     # share the result rather than each thread hitting NewsAPI separately.
@@ -2424,75 +2774,187 @@ def handle_portfolio(chat_id, scheduled=False):
     # ── Build per-position record ───────────────────────────────────────
     records = []
     for ticker, pos in portfolio.items():
-        shares = pos["shares"]
-        entry = pos["entry_price"]
-        f = fundamentals.get(ticker)
-        current = (f or {}).get("currentPrice") or get_current_price(ticker)
+        # Wrap the whole per-position block so a single bad fetch can't
+        # crash the entire /portfolio command (per reliability spec).
+        try:
+            shares = pos["shares"]
+            entry = pos["entry_price"]
+            f = fundamentals.get(ticker)
+            current = (f or {}).get("currentPrice") or get_current_price(ticker)
 
-        target = _safe_target(pos.get("analyst_target"))
-        if target is None and f:
-            live_target = _safe_target(f.get("targetMeanPrice"))
-            if live_target is not None:
-                target = live_target
-                pos["analyst_target"] = target
+            target = _safe_target(pos.get("analyst_target"))
+            if target is None and f:
+                live_target = _safe_target(f.get("targetMeanPrice"))
+                if live_target is not None:
+                    target = live_target
+                    pos["analyst_target"] = target
+                    portfolio_dirty = True
+
+            # ── Backfill new schema fields for legacy positions ─────────
+            # peak_price / sector / atr_pct / atr_stop_pct / tightened_stop.
+            if pos.get("peak_price") is None:
+                pos["peak_price"] = entry
+                portfolio_dirty = True
+            if pos.get("sector") is None and f and f.get("sector"):
+                pos["sector"] = str(f["sector"]).strip()
+                portfolio_dirty = True
+            if pos.get("tightened_stop") is None:
+                pos["tightened_stop"] = False
                 portfolio_dirty = True
 
-        stop_price = entry * stop_factor
+            # ── Weekly ATR refresh (or first-time backfill) ─────────────
+            atr_age_days = None
+            if pos.get("atr_last_calc"):
+                try:
+                    last = datetime.strptime(
+                        pos["atr_last_calc"], "%Y-%m-%d"
+                    )
+                    atr_age_days = (datetime.utcnow() - last).days
+                except Exception:
+                    atr_age_days = None
+            if pos.get("atr_pct") is None or (
+                atr_age_days is not None and atr_age_days >= ATR_RECALC_DAYS
+            ):
+                new_atr_pct, _ = calculate_atr(ticker)
+                if new_atr_pct is not None:
+                    pos["atr_pct"] = new_atr_pct
+                    pos["atr_stop_pct"] = get_atr_stop_pct(new_atr_pct)
+                    pos["atr_last_calc"] = today_iso
+                    portfolio_dirty = True
+                elif pos.get("atr_stop_pct") is None:
+                    # First-time backfill failed → use the default -7%.
+                    pos["atr_stop_pct"] = STOP_LOSS_PCT
+                    pos["atr_last_calc"] = today_iso
+                    portfolio_dirty = True
 
-        prev_score = pos.get("momentum_score")  # may be None
-        score_details = momentum_map.get(ticker)
-        score = score_details[0] if score_details else None
-        details = score_details[1] if score_details else {}
+            prev_score = pos.get("momentum_score")  # may be None
+            score_details = momentum_map.get(ticker)
+            score = score_details[0] if score_details else None
+            details = score_details[1] if score_details else {}
 
-        # NEW: portfolio-position rule overlay — SELL if score<35 OR
-        # current price ≤ entry × (1 + STOP_LOSS_PCT/100). This is
-        # different from the pure momentum signal used by /deep & /monthly.
-        signal, color, stop_breached = apply_position_rules(
-            score, current, entry,
-        )
+            # ── Update peak_price (only when NOT in tightened mode) ─────
+            # In tightened mode we keep the trailing stop frozen so
+            # bouncing prices don't ratchet the stop up.
+            if (current is not None and not pos.get("tightened_stop")
+                    and current > float(pos.get("peak_price", entry) or entry)):
+                pos["peak_price"] = float(current)
+                portfolio_dirty = True
 
-        # BONUS context flag (display-only, not a trigger): price has
-        # already exceeded the analyst target — stock may be overextended.
-        above_target = (
-            current is not None
-            and target is not None
-            and current > target
-        )
+            # ── Watch-zone tightened-stop transitions ───────────────────
+            # Score in [35, 50) → tighten stop to -3% from current,
+            #                     but NEVER lower than the existing
+            #                     peak-based trailing stop (otherwise
+            #                     entering watch zone could clear an
+            #                     already-breached SELL — bug fix per
+            #                     architect review).
+            # Score >= 50      → restore trailing -X% from new peak.
+            if score is not None and current is not None:
+                in_watch_zone = 35 <= score < 50
+                is_tightened = bool(pos.get("tightened_stop"))
+                if in_watch_zone and not is_tightened:
+                    # Compute both candidate stops and take the higher
+                    # (more protective) — the watch-zone tighten can
+                    # only ever raise the stop, never lower it.
+                    peak_for_calc = float(
+                        pos.get("peak_price", entry) or entry
+                    )
+                    atr_pct = pos.get("atr_stop_pct", STOP_LOSS_PCT)
+                    peak_based_stop = round(
+                        peak_for_calc * (1.0 + atr_pct / 100.0), 2,
+                    )
+                    candidate_tight = round(
+                        current * (1.0 + WATCH_TIGHTENED_STOP_PCT / 100.0),
+                        2,
+                    )
+                    pos["tightened_stop"] = True
+                    pos["tightened_stop_price"] = max(
+                        candidate_tight, peak_based_stop,
+                    )
+                    portfolio_dirty = True
+                    transition_alerts.append((
+                        f"⚠️ {ticker} momentum weakening (score {score}). "
+                        f"Stop tightened to ${pos['tightened_stop_price']:.2f} "
+                        f"(higher of -3% from current ${current:.2f} "
+                        f"or existing trailing stop ${peak_based_stop:.2f}). "
+                        f"Last chance for recovery."
+                    ))
+                elif score >= 50 and is_tightened:
+                    pos["tightened_stop"] = False
+                    pos.pop("tightened_stop_price", None)
+                    pos["peak_price"] = max(
+                        float(pos.get("peak_price", current) or current),
+                        float(current),
+                    )
+                    portfolio_dirty = True
+                    atr_pct_for_msg = pos.get("atr_stop_pct", STOP_LOSS_PCT)
+                    transition_alerts.append((
+                        f"✅ {ticker} momentum recovering (score {score}). "
+                        f"Stop restored to {atr_pct_for_msg:.0f}% trailing."
+                    ))
 
-        # Persist the freshly-computed score so tomorrow's scheduled run
-        # can compare against today's value.
-        if score is not None and pos.get("momentum_score") != score:
-            pos["momentum_score"] = score
-            portfolio_dirty = True
+            # ── Compute effective stop AFTER all transition logic ───────
+            stop_price, stop_mode = compute_trailing_stop(pos, current)
 
-        if current is None:
-            records.append({
+            signal, color, stop_breached = apply_position_rules(
+                score, current, stop_price,
+            )
+
+            # BONUS context flag (display-only, not a trigger): price
+            # has already exceeded the analyst target.
+            above_target = (
+                current is not None
+                and target is not None
+                and current > target
+            )
+
+            # Persist the freshly-computed score so tomorrow's scheduled
+            # run can compare against today's value.
+            if score is not None and pos.get("momentum_score") != score:
+                pos["momentum_score"] = score
+                portfolio_dirty = True
+
+            common = {
                 "ticker": ticker, "shares": shares, "entry": entry,
-                "current": None, "target": target, "stop": stop_price,
-                "pl_dollar": None, "pl_pct": None,
+                "target": target,
+                "stop": stop_price, "stop_mode": stop_mode,
+                "peak": float(pos.get("peak_price", entry) or entry),
+                "atr_pct": pos.get("atr_pct"),
+                "atr_stop_pct": pos.get("atr_stop_pct", STOP_LOSS_PCT),
+                "sector": pos.get("sector"),
                 "signal": signal, "color": color,
                 "score": score, "prev_score": prev_score,
                 "details": details, "reason": None,
                 "stop_breached": stop_breached,
                 "above_target": above_target,
-            })
-            continue
+            }
 
-        pl_dollar = (current - entry) * shares
-        pl_pct = ((current - entry) / entry) * 100
-        records.append({
-            "ticker": ticker, "shares": shares, "entry": entry,
-            "current": current, "target": target, "stop": stop_price,
-            "pl_dollar": pl_dollar, "pl_pct": pl_pct,
-            "signal": signal, "color": color,
-            "score": score, "prev_score": prev_score,
-            "details": details, "reason": None,
-            "stop_breached": stop_breached,
-            "above_target": above_target,
-        })
+            if current is None:
+                common.update({
+                    "current": None, "pl_dollar": None, "pl_pct": None,
+                })
+                records.append(common)
+                continue
+
+            pl_dollar = (current - entry) * shares
+            pl_pct = ((current - entry) / entry) * 100
+            common.update({
+                "current": current, "pl_dollar": pl_dollar, "pl_pct": pl_pct,
+            })
+            records.append(common)
+        except Exception as exc:
+            print(f"[/portfolio {ticker}] per-position build failed: {exc}")
+            continue
 
     if portfolio_dirty:
         save_portfolio(portfolio)
+
+    # Fire any tightened/restored stop transition alerts before the
+    # main report so they surface to the top of the user's feed.
+    for msg in transition_alerts:
+        try:
+            send_telegram(msg, chat_id, parse_mode=None)
+        except Exception as exc:
+            print(f"[/portfolio] transition alert failed: {exc}")
 
     # ── Single batched Claude call → one-sentence momentum reason ──────
     judged = [r for r in records if r["score"] is not None]
@@ -2510,16 +2972,20 @@ def handle_portfolio(chat_id, scheduled=False):
     if scheduled:
         for r in records:
             # SELL alert fires whenever the rule overlay says SELL —
-            # whether the trigger was momentum < 35 OR the -7% stop
-            # being breached.
+            # whether the trigger was momentum < 35 OR the trailing
+            # stop being breached.
             if r["signal"] == "SELL":
                 if r.get("stop_breached"):
                     pl_pct_txt = (
                         f"{r['pl_pct']:+.1f}%" if r.get("pl_pct") is not None
                         else "n/a"
                     )
+                    mode_txt = (
+                        " (tightened -3% from current)"
+                        if r.get("stop_mode") == "tightened" else ""
+                    )
                     trigger = (
-                        f"Stop loss breached — current "
+                        f"Trailing stop breached{mode_txt} — current "
                         f"${r['current']:.2f} ≤ stop ${r['stop']:.2f} "
                         f"(P&L {pl_pct_txt} from entry ${r['entry']:.2f})."
                     )
@@ -2580,32 +3046,60 @@ def handle_portfolio(chat_id, scheduled=False):
                 # Bonus context flag (display-only — not a sell trigger):
                 # the position is trading ABOVE the analyst consensus
                 # target, which historically means it's overextended.
-                target_str = (
-                    f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside, "
-                    f"⚠️ above target — may be overextended) | "
-                    f"Stop: ${r['stop']:.2f}"
+                target_line = (
+                    f"Target: ${r['target']:.0f} "
+                    f"({upside_pct:+.0f}% upside, "
+                    f"⚠️ above target — may be overextended)"
                 )
             else:
-                target_str = (
-                    f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside) | "
-                    f"Stop: ${r['stop']:.2f}"
+                target_line = (
+                    f"Target: ${r['target']:.0f} "
+                    f"({upside_pct:+.0f}% upside)"
                 )
         else:
-            target_str = f"Target: n/a | Stop: ${r['stop']:.2f}"
+            target_line = "Target: n/a"
 
-        # If SELL was triggered by the -7% stop loss (not by momentum
-        # alone), surface the trigger as a dedicated line so it can't be
-        # missed in the per-position breakdown.
+        # ── Trailing-stop line — shows the current stop, mode, peak, ATR ──
+        atr_pct = r.get("atr_pct")
+        atr_stop_pct = r.get("atr_stop_pct", STOP_LOSS_PCT)
+        peak = r.get("peak", r["entry"])
+        if r.get("stop_mode") == "tightened":
+            stop_line = (
+                f"Trailing Stop: ${r['stop']:.2f} "
+                f"(⚠️ tightened to -3% from current — watch zone)"
+            )
+        else:
+            atr_label = (
+                f", ATR {atr_pct:.2f}%" if atr_pct is not None else ""
+            )
+            stop_line = (
+                f"Trailing Stop: ${r['stop']:.2f} "
+                f"({abs(atr_stop_pct):.0f}% below peak ${peak:.2f}{atr_label})"
+            )
+
+        # Sector line (only when we have one)
+        sector_line = (
+            f"Sector: {r['sector']}\n" if r.get("sector") else ""
+        )
+
+        # If SELL was triggered by the trailing stop, surface the trigger
+        # as a dedicated line so it can't be missed.
         trigger_line = ""
         if r.get("stop_breached"):
+            mode_txt = (
+                " (tightened to -3% from current — watch zone)"
+                if r.get("stop_mode") == "tightened"
+                else f" ({abs(atr_stop_pct):.0f}% below peak ${peak:.2f})"
+            )
             trigger_line = (
-                f"⛔ STOP LOSS BREACHED — current ${r['current']:.2f} "
-                f"≤ stop ${r['stop']:.2f} (-7% from entry)\n"
+                f"⛔ TRAILING STOP BREACHED — current ${r['current']:.2f} "
+                f"≤ stop ${r['stop']:.2f}{mode_txt}\n"
             )
 
         # Spec format: full momentum breakdown then position math then reason.
-        send_telegram(
+        _send_chunked(
             f"{r['color']} {r['ticker']} — {r['signal']}\n"
+            f"{sector_line}"
             f"Momentum Score: {score_str}\n"
             f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
             f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
@@ -2613,13 +3107,14 @@ def handle_portfolio(chat_id, scheduled=False):
             f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
             f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
             f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
-            f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+            f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n"
             f"News: {d.get('news', 'n/a')}\n"
             f"Earnings: "
             f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
             f"{trigger_line}"
             f"{pl_line}\n"
-            f"{target_str}\n"
+            f"{target_line}\n"
+            f"{stop_line}\n"
             f"{r['reason']}",
             chat_id,
             parse_mode=None,
@@ -2745,7 +3240,7 @@ def handle_deep(args, chat_id):
                 f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
                 f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
                 f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
-                f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+                f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n"
                 f"News: {d.get('news', 'n/a')}\n"
                 f"Earnings: "
                 f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
@@ -2790,21 +3285,25 @@ def handle_start(chat_id):
     send_telegram(
         "Welcome to *Portfolio Bot*\n\n"
         "Commands:\n"
-        "`/buy TICKER SHARES PRICE` — add a position\n"
+        "`/buy TICKER SHARES PRICE` — add a position (sector cap: 3/sector)\n"
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
         "`/portfolio` — momentum-scored daily view (one msg per position + summary)\n"
-        "`/health` — portfolio health score (0–10) with breakdown\n"
+        "`/cash` — total value, invested, idle cash + treasury suggestion\n"
+        "`/health` — portfolio health score (0–10) + sector breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
         "`/deep TICKER` — full momentum analysis on any stock\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
         "`/performance` — track record vs S&P 500\n\n"
         "_Hard SELL rules:_\n"
-        "_• -7% stop loss (capital protection)_\n"
-        "_• price ≥ analyst target (above fair value — strong sell)_\n"
+        "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
+        "_• Tightened to -3% from current when momentum score 35–49_\n"
+        "_• Momentum score < 35 (capital protection)_\n"
+        "_• Price ≥ analyst target (above fair value — strong sell)_\n"
         "_Soft alert:_\n"
-        "_• price ≥ 90% of analyst target (approaching fair value)_\n"
+        "_• Price ≥ 90% of analyst target (approaching fair value)_\n"
+        "_• 08:00 UTC pre-market gap-down check vs trailing stop_\n"
         "_Targets are fetched at /buy and refreshed on the 1st of each month._",
         chat_id,
     )
@@ -2865,13 +3364,51 @@ def poll_telegram():
                             daemon=True,
                         ).start()
                     elif cmd == "/earnings":
-                        handle_earnings(chat_id)
+                        # Earnings calls AlphaVantage with a 13-second
+                        # throttle per ticker — push to a background
+                        # thread so the polling loop doesn't block for
+                        # >1 minute on a 6-position portfolio.
+                        send_telegram(
+                            "Analyzing… please wait", chat_id,
+                        )
+                        Thread(
+                            target=handle_earnings,
+                            args=(chat_id,),
+                            daemon=True,
+                        ).start()
                     elif cmd == "/health":
-                        handle_health(chat_id)
+                        send_telegram(
+                            "Analyzing… please wait", chat_id,
+                        )
+                        Thread(
+                            target=handle_health,
+                            args=(chat_id,),
+                            daemon=True,
+                        ).start()
+                    elif cmd == "/cash":
+                        Thread(
+                            target=handle_cash,
+                            args=(chat_id,),
+                            daemon=True,
+                        ).start()
                     elif cmd == "/performance":
-                        handle_performance(chat_id)
+                        send_telegram(
+                            "Analyzing… please wait", chat_id,
+                        )
+                        Thread(
+                            target=handle_performance,
+                            args=(chat_id,),
+                            daemon=True,
+                        ).start()
                     elif cmd == "/review":
-                        handle_review(chat_id)
+                        send_telegram(
+                            "Analyzing… please wait", chat_id,
+                        )
+                        Thread(
+                            target=handle_review,
+                            args=(chat_id,),
+                            daemon=True,
+                        ).start()
                     elif cmd == "/deep":
                         handle_deep(args, chat_id)
                     elif cmd == "/monthly":
@@ -2984,8 +3521,6 @@ def calculate_health_score(portfolio=None, fundamentals=None):
     if fundamentals is None:
         fundamentals = fetch_fundamentals_bulk(list(portfolio.keys()))
 
-    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)
-
     rows = []
     for ticker, pos in portfolio.items():
         f = fundamentals.get(ticker) or {}
@@ -2995,8 +3530,15 @@ def calculate_health_score(portfolio=None, fundamentals=None):
         target = _safe_target(pos.get("analyst_target"))
         if target is None:
             target = _safe_target(f.get("targetMeanPrice"))
-        sector_raw = f.get("sector")
-        sector = sector_raw.strip() if isinstance(sector_raw, str) else None
+        # Prefer the persisted sector (set by /buy or backfilled by
+        # /portfolio); fall back to the live yfinance sector.
+        sector = pos.get("sector")
+        if not sector:
+            sector_raw = f.get("sector")
+            sector = sector_raw.strip() if isinstance(sector_raw, str) else None
+        # Use the actual trailing stop (peak-based + ATR-adjusted, or
+        # tightened in the watch zone) — not the legacy entry × -7%.
+        stop_price, _stop_mode = compute_trailing_stop(pos, current)
         rows.append(
             {
                 "ticker": ticker,
@@ -3005,7 +3547,7 @@ def calculate_health_score(portfolio=None, fundamentals=None):
                 "current": current,
                 "target": target,
                 "sector": sector or None,
-                "stop_price": pos["entry_price"] * stop_factor,
+                "stop_price": stop_price,
             }
         )
 
@@ -3100,11 +3642,20 @@ def calculate_health_score(portfolio=None, fundamentals=None):
     else:
         emoji, label = "🚨", "Critical"
 
+    # Sector breakdown — count holdings per sector + flag the
+    # max-3-per-sector cap so /health can render a concentration table.
+    sector_counts = {}
+    for r in rows:
+        sec = r.get("sector") or "Unknown"
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
     return {
         "score": total,
         "rating_emoji": emoji,
         "rating_label": label,
         "components": components,
+        "sector_counts": sector_counts,
+        "total_positions": len(rows),
     }
 
 
@@ -3132,6 +3683,17 @@ def format_health_breakdown(report):
         # render it without Markdown emphasis so unexpected `_` or `*`
         # characters can't break Telegram's Markdown parser.
         lines.append(f"• *{name}:* {score:.1f}/10 — {detail}")
+
+    # ── Sector concentration table (max 3 per sector cap) ──────────────
+    sector_counts = report.get("sector_counts") or {}
+    if sector_counts:
+        lines.append("")
+        lines.append("*Sector breakdown* (cap: 3 per sector)")
+        for sec, n in sorted(
+            sector_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            flag = " ⚠️ at cap" if n >= MAX_POSITIONS_PER_SECTOR else ""
+            lines.append(f"• {sec}: {n}{flag}")
     return "\n".join(lines)
 
 
@@ -3142,7 +3704,86 @@ def handle_health(chat_id):
         send_telegram("Your portfolio is empty.", chat_id)
         return
     report = calculate_health_score(portfolio)
-    send_telegram(format_health_breakdown(report), chat_id)
+    _send_chunked(format_health_breakdown(report), chat_id)
+
+
+def handle_cash(chat_id):
+    """`/cash` — total value, invested, idle cash + treasury suggestion.
+
+    Reads cash.json (bootstrapping it on first call from
+    INITIAL_CASH minus the cost of every existing position) and combines
+    it with the live market value of the portfolio to show:
+      • Total portfolio value (positions + cash)
+      • Invested amount (entry × shares)
+      • Current market value of positions
+      • Available cash
+      • A nudge to park idle cash > $500 in BIL/SGOV (≈5% yield)
+    """
+    cash_data = load_cash()
+    cash = float(cash_data.get("cash", 0.0))
+
+    portfolio = load_portfolio()
+    invested = 0.0
+    market_value = 0.0
+    if portfolio:
+        try:
+            fundamentals = fetch_fundamentals_bulk(list(portfolio.keys()))
+        except Exception as exc:
+            print(f"[/cash] bulk fundamentals failed: {exc}")
+            fundamentals = {}
+        for ticker, pos in portfolio.items():
+            try:
+                shares = float(pos.get("shares", 0))
+                entry = float(pos.get("entry_price", 0))
+                invested += shares * entry
+                f = fundamentals.get(ticker) or {}
+                current = f.get("currentPrice")
+                if current is None:
+                    current = get_current_price(ticker)
+                if current is not None:
+                    market_value += shares * float(current)
+                else:
+                    # Price fetch failed → fall back to entry to avoid
+                    # underreporting the user's net worth.
+                    market_value += shares * entry
+            except Exception as exc:
+                print(f"[/cash {ticker}] valuation failed: {exc}")
+                continue
+
+    total_value = market_value + cash
+    pl = market_value - invested
+    pl_sign = "+" if pl >= 0 else "-"
+    pl_pct = (pl / invested * 100.0) if invested > 0 else 0.0
+    cash_pct = (cash / total_value * 100.0) if total_value > 0 else 100.0
+
+    lines = [
+        "💰 *CASH & ALLOCATION*",
+        f"Total value: ${total_value:,.2f}",
+        f"  • Positions: ${market_value:,.2f} "
+        f"(invested ${invested:,.2f}, "
+        f"P&L {pl_sign}${abs(pl):,.2f} / {pl_pct:+.1f}%)",
+        f"  • Cash: ${cash:,.2f} ({cash_pct:.0f}% of total)",
+    ]
+
+    # Idle-cash nudge: > $500 sitting idle → suggest BIL or SGOV which
+    # currently yield ≈5% on T-bills with daily liquidity.
+    if cash > IDLE_CASH_THRESHOLD:
+        annual_yield = cash * 0.05
+        lines.append("")
+        lines.append(
+            f"💡 *${cash:,.2f} idle* — consider parking in *BIL* or *SGOV* "
+            f"(≈5% yield on short Treasuries). Daily liquidity, no lockup. "
+            f"Estimated income: ~${annual_yield:,.0f}/yr."
+        )
+    elif cash < 0:
+        lines.append("")
+        lines.append(
+            "⚠️ Cash balance is negative — you've over-allocated relative "
+            "to the seed cash. Add a buy/sell to reconcile or top up the "
+            "balance manually in cash.json."
+        )
+
+    _send_chunked("\n".join(lines), chat_id)
 
 
 def scheduled_health_check():
@@ -3481,7 +4122,7 @@ def handle_earnings(chat_id):
             f"{', '.join(unavailable)}"
         )
 
-    send_telegram("\n".join(body), chat_id)
+    _send_chunked("\n".join(body), chat_id)
 
 
 def scheduled_earnings_check():
@@ -3536,9 +4177,254 @@ def scheduled_run():
     handle_portfolio(chat_id, scheduled=True)
 
 
+# ---------------------------------------------------------------------------
+# Gap-down pre-market check (08:00 UTC) — catches overnight crashes that
+# would push a position below its trailing stop before the user wakes up.
+# ---------------------------------------------------------------------------
+def _premarket_price(ticker):
+    """Best-effort pre-market price for ``ticker``.
+
+    Tries yfinance ``info['preMarketPrice']`` first (liquid names have
+    this in extended hours), falls back to ``get_current_price`` (last
+    regular-session close) so we can still compare against the trailing
+    stop even when no pre-market trade has printed yet.
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+        for key in ("preMarketPrice", "regularMarketPrice", "currentPrice"):
+            v = info.get(key)
+            if v is not None and float(v) > 0:
+                return float(v)
+    except Exception as exc:
+        print(f"[gap-down {ticker}] info fetch failed: {exc}")
+    return get_current_price(ticker)
+
+
+def check_gap_down(chat_id=None):
+    """Run at 08:00 UTC daily — alert if any position has gapped below
+    its trailing stop in the pre-market session. Sends one alert per
+    breached position and a single "all clear" line if nothing tripped.
+    """
+    if chat_id is None:
+        chat_id = recall_chat()
+    if chat_id is None:
+        print("[gap-down] no chat has interacted yet — skipping")
+        return
+
+    portfolio = load_portfolio()
+    if not portfolio:
+        return
+
+    print(f"[gap-down] scanning {len(portfolio)} positions")
+    breached = []
+    for ticker, pos in portfolio.items():
+        try:
+            current = _premarket_price(ticker)
+            if current is None:
+                print(f"[gap-down {ticker}] no price available")
+                continue
+            stop_price, stop_mode = compute_trailing_stop(pos, current)
+            if stop_price <= 0:
+                continue
+            if current <= stop_price:
+                entry = float(pos.get("entry_price", 0) or 0)
+                pl_pct = (
+                    ((current - entry) / entry) * 100.0
+                    if entry > 0 else 0.0
+                )
+                mode_txt = (
+                    "tightened (-3% from current — watch zone)"
+                    if stop_mode == "tightened"
+                    else (
+                        f"{abs(pos.get('atr_stop_pct', STOP_LOSS_PCT)):.0f}% "
+                        f"below peak ${pos.get('peak_price', entry):.2f}"
+                    )
+                )
+                breached.append((ticker, current, stop_price, pl_pct, mode_txt))
+        except Exception as exc:
+            print(f"[gap-down {ticker}] failed: {exc}")
+            continue
+
+    if not breached:
+        print("[gap-down] all clear")
+        return
+
+    for ticker, current, stop_price, pl_pct, mode_txt in breached:
+        send_telegram(
+            f"🚨 GAP DOWN ALERT — {ticker}\n"
+            f"Pre-market price ${current:.2f} ≤ trailing stop "
+            f"${stop_price:.2f} ({mode_txt}).\n"
+            f"P&L from entry: {pl_pct:+.1f}%.\n"
+            f"Consider exiting at the open to protect capital.",
+            chat_id,
+            parse_mode=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Immediate rescan after exit — find a replacement among the top 100
+# S&P 500 names that the user doesn't already hold.
+# ---------------------------------------------------------------------------
+def find_replacement_after_exit(chat_id, exclude=None):
+    """Scan the top S&P 500 names for a replacement after a /sell.
+
+    1. Pull fundamentals for the first 100 S&P 500 tickers (a proxy for
+       the most liquid mega-cap names).
+    2. Filter through ``passes_buy_screen``.
+    3. Score momentum on the survivors.
+    4. Pick the highest-scoring name with score ≥ 65 that isn't already
+       in the user's portfolio and isn't in ``exclude`` (the just-sold
+       ticker — and any sector that would now be at the cap).
+    5. Send a "💡 Replacement opportunity" message OR a "no replacement
+       — holding cash" message + idle-cash BIL/SGOV nudge.
+
+    Runs in a background thread (spawned from /sell), so it can take
+    a few minutes without blocking the bot.
+    """
+    if exclude is None:
+        exclude = set()
+    else:
+        exclude = set(exclude)
+
+    portfolio = load_portfolio()
+    held = set(portfolio.keys())
+    excluded = held | exclude
+
+    # Sectors already at the cap — skip any candidate in those sectors so
+    # the rescan never recommends something the user couldn't /buy anyway.
+    sector_counts = {}
+    for p in portfolio.values():
+        sec = p.get("sector")
+        if sec:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+    capped_sectors = {
+        s for s, n in sector_counts.items() if n >= MAX_POSITIONS_PER_SECTOR
+    }
+
+    send_telegram(
+        "🔍 Scanning top 100 S&P 500 names for a replacement... "
+        "(takes ~2 minutes)",
+        chat_id,
+    )
+
+    try:
+        all_tickers = get_sp500_tickers()
+    except Exception as exc:
+        print(f"[rescan] SP500 fetch failed: {exc}")
+        send_telegram(
+            "⚠️ Couldn't fetch S&P 500 list — replacement scan skipped.",
+            chat_id,
+        )
+        return
+
+    candidates = [t for t in all_tickers[:100] if t not in excluded]
+    if not candidates:
+        send_telegram(
+            "No candidates left to scan after filtering out current holdings.",
+            chat_id,
+        )
+        return
+
+    try:
+        fundamentals = fetch_fundamentals_bulk(candidates)
+    except Exception as exc:
+        print(f"[rescan] fundamentals failed: {exc}")
+        fundamentals = {}
+
+    survivors = [
+        f for f in fundamentals.values()
+        if passes_buy_screen(f)
+        and f.get("ticker") not in excluded
+        and (f.get("sector") or "").strip() not in capped_sectors
+    ]
+    if not survivors:
+        _send_no_replacement(chat_id)
+        return
+
+    surv_tickers = [f["ticker"] for f in survivors]
+    surv_funds = {f["ticker"]: f for f in survivors}
+
+    try:
+        news_map = fetch_news_bulk(surv_tickers, days=7)
+    except Exception as exc:
+        print(f"[rescan] news fetch failed: {exc}")
+        news_map = {}
+
+    momentum_map = score_momentum_bulk(
+        surv_tickers, fundamentals=surv_funds, news_map=news_map,
+    )
+
+    ranked = sorted(
+        ((t, s, d) for t, (s, d) in momentum_map.items() if s is not None),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    qualifying = [r for r in ranked if r[1] >= 65]
+    if not qualifying:
+        _send_no_replacement(chat_id, top_score=ranked[0][1] if ranked else 0)
+        return
+
+    ticker, score, d = qualifying[0]
+    f = surv_funds.get(ticker, {}) or {}
+    current_px = f.get("currentPrice")
+    target = _safe_target(f.get("targetMeanPrice"))
+    sector = (f.get("sector") or "").strip() or "Unknown"
+    upside_line = ""
+    if current_px and target:
+        upside = ((target - current_px) / current_px) * 100
+        upside_line = (
+            f"\nAnalyst target: ${target:.2f} "
+            f"({upside:+.1f}% upside)"
+        )
+    price_line = (
+        f"Current: ${current_px:.2f}" if current_px else "Current: n/a"
+    )
+    _send_chunked(
+        f"💡 *REPLACEMENT OPPORTUNITY*\n"
+        f"After your exit, the top S&P 500 momentum candidate is:\n\n"
+        f"🟢 *{ticker}* — Score {score}/100 (BUY)\n"
+        f"Sector: {sector}\n"
+        f"{price_line}{upside_line}\n"
+        f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+        f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
+        f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
+        f"RS vs SPY: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
+        f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n\n"
+        f"To buy: `/buy {ticker} SHARES PRICE`",
+        chat_id,
+    )
+
+
+def _send_no_replacement(chat_id, top_score=None):
+    """Send the 'no replacement found — hold cash' message + BIL/SGOV nudge."""
+    try:
+        cash = float(load_cash().get("cash", 0.0))
+    except Exception:
+        cash = 0.0
+
+    parts = [
+        "🛑 *NO REPLACEMENT FOUND*",
+        "No S&P 500 candidate scored ≥ 65 (BUY threshold) — holding cash "
+        "is the right call.",
+    ]
+    if top_score is not None and top_score > 0:
+        parts.append(f"_Top score this scan: {top_score}/100._")
+    if cash > IDLE_CASH_THRESHOLD:
+        annual_yield = cash * 0.05
+        parts.append("")
+        parts.append(
+            f"💡 *${cash:,.2f} idle* — park in *BIL* or *SGOV* "
+            f"(≈5% yield, daily liquidity). "
+            f"Estimated income: ~${annual_yield:,.0f}/yr."
+        )
+    _send_chunked("\n".join(parts), chat_id)
+
+
 schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
+# Pre-market gap-down sweep — runs alongside the earnings/weekly sweep.
+schedule.every().day.at("08:00", "UTC").do(check_gap_down)
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
 # Unified daily portfolio view at 09:00 UTC — pre-US-open. Uses analyst
 # targets + last-known prices to deliver the morning briefing before the

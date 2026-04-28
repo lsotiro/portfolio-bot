@@ -44,20 +44,23 @@ Every buy/sell signal is now driven by a **100-point momentum score** computed b
 Earnings data uses `Ticker.earnings_dates` (yfinance's modern API; `quarterly_earnings` is fully deprecated). Newest-reported quarter only — future dates with NaN "Reported EPS" are filtered out before picking `iloc[0]`.
 
 ### Position rules (`apply_position_rules`)
-For OWNED positions, `/portfolio` overlays the **stop loss** on top of the
-momentum score so SELL fires on EITHER trigger:
+For OWNED positions, `/portfolio` overlays the **trailing stop loss** on top
+of the momentum score so SELL fires on EITHER trigger:
 
 | Condition                                          | Signal        |
 |----------------------------------------------------|---------------|
-| Score < 35  **OR**  current ≤ entry × (1 + STOP_LOSS_PCT/100) | **SELL 🔴** |
+| Score < 35  **OR**  current ≤ trailing stop price  | **SELL 🔴** |
 | Score ≥ 80  AND  price above stop                  | STRONG BUY 🟢 |
 | Score ≥ 65  AND  price above stop                  | BUY 🟢        |
 | Score ≥ 50  AND  price above stop                  | HOLD 🟢       |
 | Score 35–50 AND  price above stop                  | WATCH 🟡      |
 | Score `None` (insufficient history)                | WATCH 🟡      |
 
-`apply_position_rules(score, current, entry)` returns
-`(signal, color, stop_breached)` so the caller can show WHICH trigger fired.
+`apply_position_rules(score, current, stop_price)` now takes the
+**precomputed trailing stop price** so the caller (always
+`compute_trailing_stop`) decides whether the stop is peak-based,
+ATR-adjusted, or tightened (see "Trailing stop" below). Returns
+`(signal, color, stop_breached)`.
 
 For `/deep` and `/monthly` (no portfolio context) the **pure**
 `get_momentum_signal(score)` is still used — same thresholds, no stop overlay.
@@ -143,10 +146,110 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 ### Schedules (UTC)
 - 07:30 — recommendation review check (4w/8w grading)
 - 08:00 — earnings calendar sweep (and Sunday-only weekly summary)
+- 08:00 — **gap-down pre-market check** (`check_gap_down`) — for every
+  position, fetch `preMarketPrice` (via `_premarket_price` → yfinance
+  `info`) and 🚨 alert if it's already below the trailing stop. Runs in
+  the same 08:00 slot as the earnings sweep so the user gets both
+  pre-open warnings together.
 - 08:30 — morning portfolio health score push
 - 09:00 — unified `/portfolio` daily momentum review (one msg per
   position + summary, plus prepended SELL/WARNING alerts). Pre-US-open
   briefing using the 100-point momentum scoring system.
+
+### Position management v2 — trailing stops, ATR, RVOL, sector cap, cash
+Layered on top of the 100-point momentum scoring engine. Eight new
+mechanics, all gated by constants at the top of `main.py`:
+
+**Trailing stop loss from peak** (`compute_trailing_stop(pos, current)`)
+- Every position tracks `peak_price` (high-water mark since entry).
+  `handle_portfolio` bumps it on every scan when `current > peak_price`.
+- Default stop is `peak × (1 − atr_stop_pct/100)`, returned with mode
+  `"trailing"`.
+- When a position is in the **watch zone** (score 35–49) the stop is
+  tightened at the moment of transition to
+  `max(current × 0.97, peak × (1 − atr_stop_pct/100))` — i.e. the
+  watch-zone tighten can only ever **raise** the stop, never lower it,
+  so entering watch zone with an already-breached price still fires
+  SELL. The tightened price is **frozen** in
+  `pos["tightened_stop_price"]` so subsequent dips don't keep walking
+  the stop down — the snapshot is reused until score recovers ≥ 50,
+  at which point the position exits watch zone, `peak_price` is
+  rebased to `max(peak, current)`, and the stop reverts to peak-based.
+- **`/trim`** also credits proceeds at the current price via
+  `adjust_cash` (parity with `/sell`) so cash bookkeeping doesn't
+  drift on partial exits.
+
+**ATR-adjusted stop %** (`calculate_atr` + `get_atr_stop_pct`)
+- Plain-Python 14-day True Range loop (no pandas import) over yfinance
+  `Ticker.history(period="30d")`.
+- Buckets: ATR ≥ `ATR_HIGH_VOL_THRESHOLD` (4%) → `−10%` stop,
+  `ATR_LOW_VOL_THRESHOLD` (2%) ≤ ATR < 4% → `−7%`,
+  ATR < 2% → `−5%`.
+- Computed once at `/buy` (with high-volatility warning if ≥ 4%) and
+  refreshed every `ATR_RECALC_DAYS` (7) days inside `handle_portfolio`.
+- Stored as `pos["atr_pct"]`, `pos["atr_stop_pct"]`, `pos["atr_last_calc"]`.
+
+**RVOL volume scoring** (in `score_momentum`)
+- Replaces the old up-day / down-day mean ratio with **today's volume
+  ÷ 20-day average volume** — only credits volume on green (up) days
+  to avoid rewarding panic selling.
+- Buckets: `rvol > 2.0` → 15 pts, `≥ 1.5` → 10, `≥ 1.0` → 7, else 0
+  (must be on an up day).
+- `details["rvol"]` + `details["rvol_up_day"]` populated; legacy
+  `details["vol_ratio"]` is kept (mirrors `rvol`) for back-compat with
+  `_format_momentum_for_prompt` and the rec log. `_vol_label(rvol,
+  up_day)` renders "RVOL 1.45× (Above Avg, ↑)".
+
+**Sector cap** (`MAX_POSITIONS_PER_SECTOR = 3`)
+- `handle_buy` looks up the sector via yfinance `info.get("sector")`,
+  counts how many existing positions share it, and refuses the buy
+  with a clear "sector cap reached: N/3 in <Sector>" message if a 4th
+  would be added.
+- `find_replacement_after_exit` also pre-filters out any sector
+  already at the cap so a post-sell rescan never recommends something
+  the user couldn't actually `/buy`.
+
+**Cash bookkeeping** (`cash.json`, `load_cash` / `save_cash` / `adjust_cash`)
+- Atomic, lock-guarded (`_cash_lock`) JSON file. Bootstrapped on first
+  read to `INITIAL_CASH` ($5000) — for an existing portfolio that had
+  no `cash.json`, the user can just edit the file directly.
+- `handle_buy` deducts `shares × price` from cash (and warns, but does
+  not block, if the result is negative — the user is the source of truth).
+- `handle_sell` credits `shares × exit_price` back before removing the
+  position so the next `/cash` reflects reality.
+
+**`/cash` command** (`handle_cash`)
+- Shows total portfolio value (cash + market value of holdings),
+  invested cost basis, idle cash, and — when idle cash >
+  `IDLE_CASH_THRESHOLD` ($500) — a 💡 nudge to park it in **BIL** or
+  **SGOV** (≈5% yield, daily liquidity) with the estimated annual
+  income.
+
+**Immediate replacement scan after exit** (`find_replacement_after_exit`)
+- `handle_sell` (full close only) spawns a daemon thread that
+  `time.sleep(RESCAN_DELAY_SECONDS)` (5 min) then runs the scan: top
+  100 S&P 500 tickers → `passes_buy_screen` → `score_momentum_bulk` →
+  highest score ≥ 65 not in current portfolio and not in any
+  capped sector. Sends a 💡 *REPLACEMENT OPPORTUNITY* message OR a
+  🛑 *NO REPLACEMENT FOUND* + BIL/SGOV nudge if nothing qualifies.
+  The 5-min delay gives the market a moment to settle after the exit
+  print before scanning.
+
+### Reliability
+- **`_send_chunked(text, chat_id, parse_mode)`** — splits any message >
+  4000 chars on `\n` boundaries, with a hard mid-line fallback for
+  pathological cases. Used by every multi-line aggregator handler
+  (`/portfolio`, `/health`, `/cash`, `/performance`, `/review`,
+  `/earnings`, replacement scanner).
+- **"Analyzing… please wait" pre-msg** — sent immediately by the poll
+  loop before kicking the slow handlers (`/portfolio`, `/earnings`,
+  `/health`, `/performance`, `/review`) to a daemon thread so the
+  Telegram long-poll never blocks > 1s. `/cash` is fast enough to skip
+  the pre-msg but still backgrounded for safety.
+- **Per-stock try/except** — every loop in `handle_portfolio`,
+  `handle_earnings`, `find_replacement_after_exit`, and
+  `check_gap_down` wraps the per-ticker work in try/except so one bad
+  yfinance / Alpha Vantage fetch can't crash the entire command.
 
 ### Unified `/portfolio` (daily momentum view)
 - Single command + single 09:00 UTC scheduled push. Replaces the old
@@ -202,7 +305,9 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
   the rec with `momentum_score_at_recommendation`.
 
 ### Commands
-`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`
+`/buy` (sector-capped), `/sell` (auto-rescan after 5 min), `/trim`,
+`/portfolio`, `/cash`, `/health` (with sector breakdown), `/earnings`,
+`/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`
 
 ### Web Dashboard (`portfolio-bot/dashboard.py`)
 - Separate Flask app started in its own daemon thread from `main.py`.

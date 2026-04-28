@@ -1,0 +1,94 @@
+Implement these 8 improvements to the portfolio bot in main.py. Do them all in one update:
+
+1. TRAILING STOP LOSS
+- Replace the fixed -7% stop loss from entry price with a trailing stop loss
+- Store the highest price reached since entry for each position in portfolio.json as 'peak_price'
+- Update peak_price every morning if current price is higher than stored peak
+- Stop loss is always -7% from peak_price, not entry price
+- Example: Entry $175, peak reached $220, trailing stop = $220 * 0.93 = $204.60
+- When /buy is called, set peak_price = entry price initially
+- Show trailing stop in /portfolio as "Trailing Stop: $X (7% below peak of $X)"
+- If current price drops below trailing stop → immediate SELL alert
+
+2. GAP DOWN PRE-MARKET CHECK
+- Add a new function check_gap_down() that runs at 8:00 AM UTC every day
+- For each position, fetch the current pre-market or latest price from yfinance
+- If price is already below the trailing stop loss → send immediate Telegram alert:
+  🚨 GAP DOWN ALERT — TICKER
+  Price $X is below trailing stop $X
+  Do not wait for bounce — sell at market open
+  Loss from entry: X% | Loss from peak: X%
+- This runs BEFORE the regular 9AM portfolio report
+
+3. IMMEDIATE RESCAN AFTER EXIT
+- When a position is closed (stop loss hit OR momentum score drops below 35):
+  * Send the sell alert as normal
+  * Wait 5 minutes
+  * Automatically run a mini momentum scan of top 100 S&P 500 stocks
+  * Filter by fundamentals first
+  * Find any stock with momentum score >= 65 that is NOT already in portfolio
+  * If found: send Telegram message "💡 Replacement opportunity found: TICKER (score XX/100) — run /deep TICKER for full analysis"
+  * If not found: send "No replacement found — holding cash. Consider BIL or SGOV for yield."
+
+4. SECTOR CAP (MAX 3 PER SECTOR)
+- When /buy is called, fetch the sector from yfinance info['sector']
+- Count how many existing positions are in that sector
+- If 3 or more positions already in that sector → reject the buy and send:
+  "⚠️ Sector cap reached — already have 3 positions in [SECTOR]. Diversify into a different sector."
+- Store sector in portfolio.json for each position
+- In /portfolio show sector for each position
+- In /health command show sector breakdown:
+  Technology: 2/3 positions
+  Financials: 1/3 positions
+  Healthcare: 0/3 positions
+
+5. WATCH ZONE STOP TIGHTENING
+- When momentum score is between 35-49 (Watch zone):
+  * Automatically tighten the trailing stop from -7% to -3% from current price
+  * Send alert: "⚠️ TICKER momentum weakening (score XX). Stop tightened to $X (-3% from current $X). Last chance for recovery."
+- When momentum score recovers above 50:
+  * Restore trailing stop to -7% from new peak
+  * Send alert: "✅ TICKER momentum recovering (score XX). Stop restored to -7% trailing."
+- Store tightened_stop flag in portfolio.json
+
+6. ATR-ADJUSTED STOP LOSS
+- Calculate the 14-day Average True Range (ATR) for each stock when added to portfolio
+- If ATR% (ATR/price) > 4%: the stock is highly volatile
+  * For volatile stocks (ATR > 4%): use -10% trailing stop instead of -7%
+  * Send note when buying: "⚠️ High volatility stock — using wider -10% stop to avoid whipsawing"
+- If ATR% < 2%: low volatility stock
+  * Use -5% trailing stop
+- Store atr_stop_pct in portfolio.json per position
+- Recalculate ATR weekly
+
+7. RELATIVE VOLUME (RVOL) SCORING
+- Replace the current volume confirmation scoring with RVOL
+- Calculate RVOL = today's volume / 20-day average volume
+- In momentum scoring:
+  * RVOL > 2.0 on up day: +15 points (strong institutional buying)
+  * RVOL 1.5-2.0 on up day: +10 points
+  * RVOL 1.0-1.5 on up day: +7 points
+  * RVOL < 1.0 or down day: +0 points
+- Show RVOL in momentum report: "Volume: RVOL 2.3x (institutional buying confirmed ✅)"
+
+8. TREASURY ETF FOR IDLE CASH
+- Track available cash in a file called cash.json
+- Initial cash = 5000 minus total cost of all current positions
+- When a position is sold, add proceeds back to cash.json
+- When a position is bought, deduct from cash.json
+- If available cash > $500 and no replacement opportunity found after an exit:
+  * Suggest in Telegram: "💰 $X idle cash detected. Consider parking in BIL (T-Bills ETF, ~5% yield) or SGOV until next opportunity."
+- Add /cash command to Telegram that shows:
+  * Total portfolio value
+  * Invested amount
+  * Cash available
+  * If cash > $500: show current BIL/SGOV yield estimate
+
+ALSO FIX THESE EXISTING ISSUES:
+- Make sure /portfolio, /deep, /monthly, /health, /earnings, /performance all work correctly
+- Each command should respond within 30 seconds maximum
+- If any command takes longer, send "Analyzing... please wait" first
+- Split all long messages into chunks of max 4000 characters so Telegram doesn't cut them off
+- Add error handling to every function so if one stock fails to fetch data, it skips that stock and continues rather than crashing the whole command
+
+Restart the bot after all changes and confirm each feature is working.
