@@ -55,11 +55,68 @@ Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the
 - One-line summary embedded at top of `/portfolio`; full breakdown via `/health` and the daily 08:30 UTC push.
 - When data is missing for a component, score floors at 1.0 with an "(insufficient data)" note (matches the spec's lowest published bucket).
 
+### Deep Analysis Framework (5-pillar)
+- `get_rich_fundamentals(ticker)` — superset of basic snapshot adding valuation
+  (PEG, P/S, P/B, EV/EBITDA), quarterly growth fields, margins (gross/op/net),
+  health (D/E, current ratio, FCF, ROE, ROA), ownership %, and computed:
+  - **Analyst conviction** = `10 - ((targetHigh - targetLow) / targetMean × 10)` clamped 0-10. Tighter spread = higher conviction.
+  - **Earnings trend** — last 4 reported EPS via `get_earnings_dates(limit=12)` → 3 q/q growth rates → `accelerating` / `decelerating` / `mixed` / `insufficient`.
+- **5-pillar Claude prompt** (`FRAMEWORK_INSTRUCTIONS`): Business Quality / Growth Trajectory / Valuation / Catalyst / Risk, each scored 1-5. Total /25 → **STRONG BUY 20-25, BUY 15-19, HOLD 10-14, SELL <10**. Each pick gets concrete price target, stop loss, time horizon (weeks), bull/bear paragraphs.
+- Used by:
+  - `/analyze` daily monitor — batch call scores all non-forced positions.
+  - `/monthly` — basic fetch on SP500 → hard filter → rich fetch only on the survivors → framework + top-2 pick.
+  - `/deep TICKER` — single-stock on-demand deep dive.
+
+### News Sentiment
+- `headline_sentiment(text)` — keyword regex with word boundaries; returns -1 / 0 / +1.
+- Each article carries a `sentiment` field; `aggregate_sentiment(articles)` averages to [-1, +1].
+- `format_news_block` includes per-headline POS/NEG/NEU tag and aggregate score, fed to all Claude prompts.
+
+### Feedback Loop & Performance Tracking
+Every recommendation the bot makes is appended to `recommendations_log.json`,
+graded against SPY at the 4-week and 8-week marks, and surfaced via
+`/performance` and `/review`.
+
+- **Sources logged**: monthly screen picks, `/deep TICKER` results,
+  `/buy` confirmations (deep analysis runs in a background thread so
+  the user gets the position confirmation immediately), and any SELL
+  signals from the daily monitor.
+- **Schema** (`recommendations_log.json`): `id`, `date`, `ticker`,
+  `source`, `signal`, `framework_score`, `price_at_recommendation`,
+  `claude_target`, `analyst_target`, `stop_loss`, `bull_case`,
+  `bear_case`, `sp500_at_recommendation`, `status` (open/closed),
+  plus `review_4w_*` / `review_8w_*` fields populated at review time.
+- **Atomic, lock-guarded writes** — `save_recs` writes via
+  temp-file + `os.replace` and `_recs_lock` brackets every read/write
+  so concurrent `/buy` background threads can't corrupt the log.
+- **Daily 07:30 UTC** `check_recommendation_reviews` — for each open
+  rec hitting its 4w or 8w date, fetches current price + current SPY,
+  compares the two returns, and marks **CORRECT** (beat SPY),
+  **INCORRECT** (lagged), or **STOPPED** (touched stop-loss intraday
+  inside the window). 8w review additionally sets `status=closed`.
+  If SPY history is unavailable that day, the review is **deferred**
+  rather than scored against a 0% benchmark — preserves win-rate integrity.
+- **Sunday 08:00 UTC** weekly summary — recap of any reviews finalized
+  in the past 7 days + running win rate + one-line Claude commentary
+  on what the strategy results suggest.
+- **`/performance`** — track record using **closed (8w-final) recs only**
+  for headline stats (4w-only mixing would distort returns). Shows total,
+  win rate, avg return vs SPY, best/worst call, win rate split by signal
+  type (STRONG BUY vs BUY) and by framework score range (20-25 vs 15-19),
+  plus the last 5 calls regardless of status.
+- **`/review`** — every open rec with current price, return-so-far, and
+  countdowns to the 4w/8w review dates.
+- **Adaptive monthly prompt** — once 10+ recs have closed,
+  `get_track_record_for_prompt()` injects historical win rates by
+  signal type and score range into the monthly screen prompt so Claude
+  can weight the most predictive factors more heavily going forward.
+
 ### Schedules (UTC)
-- 08:00 — earnings calendar sweep
+- 07:30 — recommendation review check (4w/8w grading)
+- 08:00 — earnings calendar sweep (and Sunday-only weekly summary)
 - 08:30 — morning portfolio health score push
 - 09:00 — full `/analyze` portfolio review
 - Day 1 of month — analyst target refresh, then `/analyze`
 
 ### Commands
-`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/monthly`, `/help`
+`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`

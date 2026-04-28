@@ -1,0 +1,85 @@
+Add a complete feedback loop and performance tracking system to main.py:
+
+1. Create a new file called recommendations_log.json that stores every recommendation the bot makes with this structure:
+{
+  "id": "unique_id",
+  "date": "2026-04-28",
+  "ticker": "AVGO",
+  "signal": "STRONG BUY",
+  "framework_score": 21,
+  "price_at_recommendation": 396.28,
+  "claude_target": 475.00,
+  "analyst_target": 475.49,
+  "stop_loss": 368.54,
+  "bull_case": "...",
+  "bear_case": "...",
+  "status": "open",
+  "review_4w_date": "2026-05-26",
+  "review_8w_date": "2026-06-23",
+  "review_4w_price": null,
+  "review_4w_return": null,
+  "review_4w_sp500_return": null,
+  "review_4w_result": null,
+  "review_8w_price": null,
+  "review_8w_return": null,
+  "review_8w_sp500_return": null,
+  "review_8w_result": null
+}
+
+2. Log every recommendation automatically:
+   - Every monthly screen pick gets logged
+   - Every /buy confirmation analysis gets logged
+   - Every /deep TICKER result gets logged with signal
+   - Every daily monitor SELL signal gets logged
+
+3. Create a daily check function check_recommendation_reviews() that:
+   - Runs every morning at 7:30 AM UTC (before earnings alerts)
+   - Checks all open recommendations in recommendations_log.json
+   - If today matches the 4 week review date:
+     * Fetches current price
+     * Fetches S&P 500 (SPY) price change over same period
+     * Calculates stock return vs S&P 500 return
+     * Marks result as: CORRECT if stock beat S&P 500, INCORRECT if it underperformed, STOPPED if it hit stop loss
+     * Sends Telegram alert with the verdict
+   - If today matches the 8 week review date:
+     * Same process as 4 week review
+     * Marks recommendation as "closed"
+
+4. Create a /performance command that shows:
+
+   OVERALL TRACK RECORD:
+   - Total recommendations made
+   - Win rate % (beat S&P 500)
+   - Average return of recommendations vs S&P 500
+   - Best call ever made (ticker, return)
+   - Worst call ever made (ticker, return)
+
+   BY SIGNAL TYPE:
+   - STRONG BUY win rate vs BUY win rate
+   - Average return by signal type
+
+   BY FRAMEWORK SCORE:
+   - Win rate for scores 20-25 vs 15-19
+   - This tells you if higher scores actually predict better returns
+
+   RECENT CALLS (last 5):
+   - Ticker, signal, date, current status, return so far
+
+5. Create a /review command that shows all open recommendations with:
+   - Days until 4 week review
+   - Days until 8 week review
+   - Current price vs recommendation price
+   - Current return so far
+
+6. Every Sunday at 8 AM UTC send an automatic weekly performance summary to Telegram showing:
+   - Any recommendations reviewed this week and their results
+   - Running win rate
+   - Whether the bot is beating the S&P 500 overall
+   - A one line Claude commentary on what the results suggest about the strategy
+
+7. After 10 or more closed recommendations, add this analysis to the monthly screen prompt:
+   - Include the bot's historical win rate
+   - Include which factors have been most predictive so far
+   - Ask Claude to weight those factors more heavily in current analysis
+
+Restart the bot after changes.

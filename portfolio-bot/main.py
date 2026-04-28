@@ -5,10 +5,16 @@ Commands you can send the bot:
   /sell TICKER [SHARES]      sell entire position, or only N shares
   /trim TICKER               sell 50% of a position (quick partial exit)
   /portfolio                 show current holdings with live P&L
-  /analyze                   run the daily HOLD/SELL review on holdings
+  /analyze                   run the daily 5-pillar review on holdings
+  /deep TICKER               full 5-pillar deep dive on any single stock
   /monthly                   run the monthly S&P 500 buy screen
   /earnings                  list upcoming earnings (next 30 days)
   /health                    portfolio health score (0–10) with breakdown
+
+The 5-pillar Claude framework scores each stock on Business Quality,
+Growth Trajectory, Valuation, Catalyst, and Risk (1-5 each, total /25).
+Signals: STRONG BUY 20-25 / BUY 15-19 / HOLD 10-14 / SELL <10. News
+headlines also carry +1 / 0 / -1 sentiment via a keyword heuristic.
 
 Daily schedule (UTC):
   08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
@@ -33,6 +39,7 @@ import io
 import json
 import math
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -109,6 +116,11 @@ ALPHA_VANTAGE_MIN_INTERVAL_SEC = 13.0
 
 PORTFOLIO_FILE = "portfolio.json"   # where positions are stored
 LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
+RECS_LOG_FILE = "recommendations_log.json"   # feedback-loop history
+
+# Review windows for recommendation tracking (calendar days).
+REVIEW_4W_DAYS = 28
+REVIEW_8W_DAYS = 56
 
 NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
 
@@ -233,10 +245,235 @@ def get_fundamentals(ticker):
     return snap
 
 
+# --- Rich fundamentals (deep analysis pipeline) ------------------------------
+RICH_FUNDAMENTAL_FIELDS = (
+    # Price & analyst targets
+    "currentPrice", "targetMeanPrice", "targetHighPrice", "targetLowPrice",
+    "numberOfAnalystOpinions", "recommendationMean",
+    # Valuation
+    "forwardPE", "trailingPE", "pegRatio",
+    "priceToSalesTrailing12Months", "priceToBook", "enterpriseToEbitda",
+    # Growth
+    "revenueGrowth", "earningsGrowth",
+    "earningsQuarterlyGrowth", "revenueQuarterlyGrowth",
+    # Margins
+    "grossMargins", "operatingMargins", "profitMargins",
+    # Health
+    "debtToEquity", "currentRatio", "freeCashflow",
+    "returnOnEquity", "returnOnAssets",
+    # Ownership
+    "heldPercentInsiders", "heldPercentInstitutions",
+    # Classification
+    "sector", "industry", "longName", "shortName",
+)
+
+
+def _analyst_conviction(target_high, target_low, target_mean):
+    """Tighter analyst price-target spread → higher conviction (0–10).
+
+    Formula from the spec: 10 - ((high - low) / mean * 10), clamped [0, 10].
+    Returns None when any input is missing/invalid.
+    """
+    high = _safe_float(target_high)
+    low = _safe_float(target_low)
+    mean = _safe_target(target_mean)
+    if not (high and low and mean) or high < low or mean <= 0:
+        return None
+    spread_ratio = (high - low) / mean
+    return max(0.0, min(10.0, 10.0 - spread_ratio * 10.0))
+
+
+def _earnings_trend(ticker):
+    """Look at the last 4 reported quarterly EPS and classify the trend.
+
+    Returns dict with keys: trend ("accelerating" | "decelerating" | "mixed"
+    | "insufficient" | "unavailable"), recent_eps (list of last 4 floats,
+    chronological), growth_rates (list of 3 q/q growth rates).
+    """
+    out = {"trend": "unavailable", "recent_eps": [], "growth_rates": []}
+    try:
+        ed = yf.Ticker(ticker).get_earnings_dates(limit=12)
+        if ed is None or ed.empty or "Reported EPS" not in ed.columns:
+            return out
+        reported = ed.dropna(subset=["Reported EPS"]).sort_index()
+        eps = []
+        for v in reported["Reported EPS"].tolist():
+            sv = _safe_float(v)
+            if sv is not None:
+                eps.append(sv)
+        eps = eps[-4:]
+        out["recent_eps"] = eps
+        if len(eps) < 4:
+            out["trend"] = "insufficient"
+            return out
+        rates = []
+        for i in range(3):
+            prev, curr = eps[i], eps[i + 1]
+            if prev == 0:
+                # Can't compute % growth; treat as mixed.
+                out["trend"] = "mixed"
+                return out
+            rates.append((curr - prev) / abs(prev))
+        out["growth_rates"] = rates
+        if rates[0] < rates[1] < rates[2]:
+            out["trend"] = "accelerating"
+        elif rates[0] > rates[1] > rates[2]:
+            out["trend"] = "decelerating"
+        else:
+            out["trend"] = "mixed"
+    except Exception as exc:
+        print(f"[rich] {ticker}: earnings trend lookup failed: {exc}")
+    return out
+
+
+def get_rich_fundamentals(ticker):
+    """Pull the full 'deep analysis' fundamentals snapshot for one ticker.
+
+    Returns a superset of the basic snapshot plus computed fields:
+      - analyst_conviction (0–10 from target-price spread)
+      - earnings_trend     ("accelerating" / "decelerating" / "mixed" / ...)
+      - recent_eps         (last 4 reported quarterly EPS)
+      - growth_rates       (q/q growth rates between those 4 quarters)
+    Returns None on total failure.
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception as exc:
+        print(f"[rich] {ticker}: info fetch failed: {exc}")
+        return None
+    snap = {field: info.get(field) for field in RICH_FUNDAMENTAL_FIELDS}
+    snap["ticker"] = ticker
+    if not snap.get("currentPrice"):
+        snap["currentPrice"] = info.get("regularMarketPrice")
+    snap["analyst_conviction"] = _analyst_conviction(
+        snap.get("targetHighPrice"),
+        snap.get("targetLowPrice"),
+        snap.get("targetMeanPrice"),
+    )
+    trend = _earnings_trend(ticker)
+    snap["earnings_trend"] = trend["trend"]
+    snap["recent_eps"] = trend["recent_eps"]
+    snap["growth_rates"] = trend["growth_rates"]
+    return snap
+
+
+def fetch_rich_fundamentals_bulk(tickers, max_workers=8):
+    """Parallel rich-fundamentals fetch. Returns {ticker: snap}."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(get_rich_fundamentals, t): t for t in tickers}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                snap = fut.result()
+            except Exception:
+                snap = None
+            if snap:
+                results[t] = snap
+    return results
+
+
+def rich_fundamentals_block(rich):
+    """Render a rich-fundamentals dict as a structured prompt block."""
+    if not rich:
+        return "(no fundamentals data)"
+
+    def f(key, suffix=""):
+        v = rich.get(key)
+        return format_fund(v, suffix) if v is not None else "n/a"
+
+    eps_str = (
+        ", ".join(f"{e:.2f}" for e in rich.get("recent_eps", []))
+        or "n/a"
+    )
+    conviction = rich.get("analyst_conviction")
+    conv_str = (
+        f"{conviction:.1f}/10" if conviction is not None else "n/a"
+    )
+    return (
+        f"{rich.get('ticker')} ({f('sector')} / {f('industry')}):\n"
+        f"  Price: ${f('currentPrice')}  |  "
+        f"Target mean/high/low: ${f('targetMeanPrice')} / "
+        f"${f('targetHighPrice')} / ${f('targetLowPrice')}  "
+        f"(N={f('numberOfAnalystOpinions')}, conviction {conv_str})\n"
+        f"  Valuation: trailing PE {f('trailingPE')}, fwd PE "
+        f"{f('forwardPE')}, PEG {f('pegRatio')}, "
+        f"P/S {f('priceToSalesTrailing12Months')}, "
+        f"P/B {f('priceToBook')}, EV/EBITDA {f('enterpriseToEbitda')}\n"
+        f"  Growth: revenue {f('revenueGrowth')}, earnings "
+        f"{f('earningsGrowth')}, qrtly rev {f('revenueQuarterlyGrowth')}, "
+        f"qrtly earn {f('earningsQuarterlyGrowth')}\n"
+        f"  Margins: gross {f('grossMargins')}, op {f('operatingMargins')}, "
+        f"net {f('profitMargins')}\n"
+        f"  Health: D/E {f('debtToEquity')}, current ratio "
+        f"{f('currentRatio')}, FCF {f('freeCashflow')}, "
+        f"ROE {f('returnOnEquity')}, ROA {f('returnOnAssets')}\n"
+        f"  Ownership: insider {f('heldPercentInsiders')}, institutional "
+        f"{f('heldPercentInstitutions')}\n"
+        f"  Analyst: recommendationMean {f('recommendationMean')} "
+        f"(lower = more bullish)\n"
+        f"  Last 4 quarterly EPS: [{eps_str}]  →  "
+        f"earnings trend: {rich.get('earnings_trend', 'unavailable')}"
+    )
+
+
+# --- Headline sentiment heuristic --------------------------------------------
+# Lightweight keyword classifier — not as accurate as an LLM, but free, fast,
+# and deterministic. Word boundaries via \b so we don't false-match inside
+# unrelated words ("win" inside "winter").
+_NEG_PATTERN = re.compile(
+    r"\b(miss|missed|misses|cut|cuts|loss|losses|scandal|fraud|"
+    r"lawsuit|downgrade|downgraded|resign|resigns|resigned|fired|"
+    r"decline|declines|declined|fall|falls|fell|fallen|drop|drops|"
+    r"dropped|plunge|plunges|plunged|warn|warns|warning|weak|"
+    r"weakness|disappoint|disappoints|disappointing|disappointed|"
+    r"layoff|layoffs|breach|breaches|probe|probed|investigation|"
+    r"delay|delays|delayed|recall|recalls|recalled|shortfall|"
+    r"slump|slumps|slumped|tumble|tumbles|tumbled|sinks|crashed)\b",
+    re.IGNORECASE,
+)
+_POS_PATTERN = re.compile(
+    r"\b(beat|beats|beaten|exceed|exceeds|exceeded|raise|raised|"
+    r"raises|upgrade|upgraded|upgrades|surge|surges|surged|rally|"
+    r"rallies|rallied|record|strong|stronger|strongest|accelerate|"
+    r"accelerates|accelerated|accelerating|acceleration|expand|"
+    r"expands|expanded|expansion|partnership|wins|won|contract|"
+    r"breakthrough|profit|profits|profitable|outperform|outperforms|"
+    r"outperformed|soar|soars|soared|jump|jumps|jumped|milestone|"
+    r"surpass|surpasses|surpassed|launches|approval)\b",
+    re.IGNORECASE,
+)
+
+
+def headline_sentiment(text):
+    """Return -1 (negative), 0 (neutral), or +1 (positive) for a headline."""
+    if not text:
+        return 0
+    pos = len(_POS_PATTERN.findall(text))
+    neg = len(_NEG_PATTERN.findall(text))
+    if pos > neg:
+        return 1
+    if neg > pos:
+        return -1
+    return 0
+
+
+def sentiment_label(score):
+    """Map a numeric sentiment score (int or avg float) to an emoji label."""
+    if score > 0.2:
+        return "🟢 positive"
+    if score < -0.2:
+        return "🔴 negative"
+    return "🟡 neutral"
+
+
 def get_stock_news(ticker, days=1, page_size=5):
     """Fetch the most recent NewsAPI headlines for a ticker.
 
-    Returns a list of dicts: [{title, source, publishedAt, url}, ...]
+    Each article dict carries a `sentiment` field (-1 / 0 / +1) computed
+    from the headline via the keyword heuristic above.
+
+    Returns a list of dicts: [{title, source, publishedAt, url, sentiment}].
     Empty list on any error or if NEWS_API_KEY is missing.
     """
     if not NEWS_API_KEY:
@@ -260,15 +497,24 @@ def get_stock_news(ticker, days=1, page_size=5):
         return []
     out = []
     for art in (data.get("articles") or [])[:page_size]:
+        title = (art.get("title") or "").strip()
         out.append(
             {
-                "title": (art.get("title") or "").strip(),
+                "title": title,
                 "source": (art.get("source") or {}).get("name", ""),
                 "publishedAt": art.get("publishedAt", "")[:10],
                 "url": art.get("url", ""),
+                "sentiment": headline_sentiment(title),
             }
         )
     return out
+
+
+def aggregate_sentiment(articles):
+    """Average sentiment across a list of articles, in [-1, +1]."""
+    if not articles:
+        return 0.0
+    return sum(a.get("sentiment", 0) for a in articles) / len(articles)
 
 
 def fetch_news_bulk(tickers, days=1, max_workers=10):
@@ -288,15 +534,25 @@ def fetch_news_bulk(tickers, days=1, max_workers=10):
 
 
 def format_news_block(ticker, articles):
-    """One-block summary of news for a ticker, suitable for prompts."""
+    """One-block summary of news for a ticker, suitable for prompts.
+
+    Includes per-headline sentiment label and an aggregate score line so
+    the LLM can weight news flow alongside fundamentals.
+    """
     if not articles:
-        return f"{ticker}: (no recent news)"
-    lines = [f"{ticker}:"]
+        return f"{ticker}: (no recent news) — sentiment: n/a"
+    avg = aggregate_sentiment(articles)
+    lines = [
+        f"{ticker}: aggregate sentiment {avg:+.2f} "
+        f"({sentiment_label(avg)}) across {len(articles)} headlines"
+    ]
     for a in articles:
         date = a.get("publishedAt") or "?"
         src = a.get("source") or "?"
         title = a.get("title") or "(no title)"
-        lines.append(f"  - [{date}] {src}: {title}")
+        s = a.get("sentiment", 0)
+        s_str = "POS" if s > 0 else ("NEG" if s < 0 else "NEU")
+        lines.append(f"  [{s_str}] [{date}] {src}: {title}")
     return "\n".join(lines)
 
 
@@ -363,99 +619,134 @@ def fundamentals_line(ticker, f):
 # ---------------------------------------------------------------------------
 # Claude analysis — daily portfolio review (HOLD / SELL with fundamentals)
 # ---------------------------------------------------------------------------
+FRAMEWORK_INSTRUCTIONS = """You are a senior fundamental equity analyst at a top hedge fund with a
+short term 1–6 month investment horizon. The client has a $5,000 portfolio
+and invests $300–$500 per position.
+
+For EACH ticker below, score it on this exact 5-pillar framework:
+
+BUSINESS QUALITY (1-5):
+- Competitive moat? Management credibility? Durable business model?
+
+GROWTH TRAJECTORY (1-5):
+- Are revenue/earnings growth ACCELERATING or DECELERATING quarter over
+  quarter (look at the quarterly trend, not just the annual number).
+- Are margins expanding or contracting?
+
+VALUATION (1-5):
+- PEG ratio below 2 (growth at reasonable price)?
+- Forward P/E vs sector?
+- Analyst target conviction (tight high–low spread = high conviction).
+
+CATALYST (1-5):
+- What specific event in the next 1–6 months could move this stock?
+  (earnings, product launch, sector rotation, macro shift)
+
+RISK (1-5):
+- The single biggest risk to the thesis. Company specific or macro?
+
+FINAL RECOMMENDATION:
+- Total score / 25
+- Signal: STRONG BUY (20-25) / BUY (15-19) / HOLD (10-14) / SELL (<10)
+- Suggested position size: $500 (strong buy), $300 (buy), $0 (hold/sell)
+- Price target: your own estimate (do NOT just copy analyst average)
+- Stop loss: your recommended level based on key support
+- Time horizon: weeks until thesis plays out
+- ONE paragraph bull case, ONE paragraph bear case
+"""
+
+
+def _format_position_for_framework(p):
+    """Render one judged position (rich fundamentals + P/L) for the prompt."""
+    rich = p.get("fundamentals") or {}
+    target = p.get("analyst_target")
+    target_str = f"${target:.2f}" if target else "n/a"
+    return (
+        f"=== {p['ticker']} (POSITION) ===\n"
+        f"  Holding: {p['shares']} shares @ entry ${p['entry_price']:.2f}, "
+        f"current ${p['current_price']:.2f}, P/L {p['pl_pct']:+.2f}%, "
+        f"stored analyst target {target_str}\n"
+        f"{rich_fundamentals_block(rich)}"
+    )
+
+
 def analyze_portfolio_with_claude(judged_positions, news_map):
-    """Ask Claude for HOLD/SELL on each non-hard-rule position.
+    """5-pillar framework review of every non-forced portfolio position.
 
-    `judged_positions` is a list of dicts that already had the hard
-    stop-loss / take-profit rule applied. `news_map` is {ticker: [articles]}
-    for the last 24 hours.
-
-    Claude is also asked to flag CRITICAL negative news (scandal, guidance
-    cut, CEO resignation, fraud) in a separate URGENT ALERTS block which the
-    caller parses and forwards as immediate Telegram alerts.
+    `judged_positions` already has the hard stop-loss / above-target rules
+    applied. We send the rich fundamentals + sentiment-tagged news in ONE
+    Claude call and ask for the framework output per ticker plus an URGENT
+    ALERTS block (consumed by parse_urgent_alerts in run_analysis).
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    rows = []
-    for p in judged_positions:
-        f = p["fundamentals"] or {}
-        rows.append(
-            f"{p['ticker']}: {p['shares']} shares, entry ${p['entry_price']}, "
-            f"current ${p['current_price']}, P/L {p['pl_pct']}% | "
-            f"PE(t/f)={format_fund(f.get('trailingPE'))}/"
-            f"{format_fund(f.get('forwardPE'))}, "
-            f"revGrowth={format_fund(f.get('revenueGrowth'))}, "
-            f"earnGrowth={format_fund(f.get('earningsGrowth'))}, "
-            f"margin={format_fund(f.get('profitMargins'))}, "
-            f"D/E={format_fund(f.get('debtToEquity'))}, "
-            f"ROE={format_fund(f.get('returnOnEquity'))}, "
-            f"analystTarget=${format_fund(f.get('targetMeanPrice'))}, "
-            f"rec={format_fund(f.get('recommendationMean'))}"
-        )
-
-    portfolio_text = "\n".join(rows)
+    positions_text = "\n\n".join(
+        _format_position_for_framework(p) for p in judged_positions
+    )
     forced_text = "\n".join(
         f"{p['ticker']}: {p['forced_signal']} — {p['forced_reason']}"
         for p in judged_positions
         if p.get("forced_signal")
     ) or "(none)"
-
     news_text = "\n\n".join(
         format_news_block(p["ticker"], news_map.get(p["ticker"], []))
         for p in judged_positions
     ) or "(no news available)"
 
-    prompt = f"""You are a senior equity analyst doing a daily portfolio review.
+    prompt = f"""{FRAMEWORK_INSTRUCTIONS}
 
-CURRENT POSITIONS (live price, P/L, fundamentals):
-{portfolio_text}
+CURRENT PORTFOLIO POSITIONS (rich fundamentals follow):
+{positions_text}
 
-POSITIONS ALREADY MARKED SELL BY HARD RULES (do not change these):
+POSITIONS ALREADY MARKED SELL BY HARD RULES (do not change these,
+just acknowledge them in the recommendation as 'forced sell'):
 {forced_text}
 
-RECENT NEWS (last 24h, NewsAPI headlines):
+RECENT NEWS (last 24h, NewsAPI headlines, with sentiment):
 {news_text}
 
-For every position NOT already in the hard-rule list above, output a clear
-HOLD or SELL signal with ONE sentence of reasoning. Use price action,
-fundamentals AND news together. Consider:
-  - revenue growth, earnings growth, profit margins, ROE trend
-  - valuation (forward PE, analyst target vs current price)
-  - leverage (debt/equity)
-  - analyst consensus (recommendationMean — lower is more bullish)
-  - news flow / sentiment shifts
-  - momentum reversal or clearly stronger opportunities elsewhere
+Apply the 5-pillar framework above to EACH non-forced position. Update
+the HOLD/SELL recommendation accordingly. For positions currently held,
+"BUY" / "STRONG BUY" should be interpreted as HOLD (we already own it);
+"HOLD" stays HOLD; "SELL" means SELL. Make the action explicit on the
+"Signal" line.
 
-Default to HOLD when the stock is still meaningfully below its analyst
-consensus target (significant remaining upside) and fundamentals/news are
-not deteriorating. Lean SELL when the upside to target has largely been
-captured even if no hard rule has triggered yet.
-
-ADDITIONALLY, scan the news for any CRITICAL negative event for any holding:
+ALSO scan the news for any CRITICAL negative event for any holding:
   - accounting scandal or fraud
   - earnings / guidance cut, missed forecast
   - CEO/CFO resignation or termination
   - regulatory action, lawsuit with material impact
   - major data breach or operational failure
-List each one in an URGENT ALERTS section. If there are none, write
+List each in an URGENT ALERTS section. If none, write
 "URGENT ALERTS: (none)".
 
 Format the reply EXACTLY like this:
 
 PORTFOLIO REVIEW:
-TICKER — HOLD or SELL — reason
-TICKER — HOLD or SELL — reason
-...
+
+=== TICKER ===
+Business Quality: X/5 — note
+Growth Trajectory: X/5 — note
+Valuation: X/5 — note
+Catalyst: X/5 — note
+Risk: X/5 — note
+Total: XX/25
+Signal: HOLD or SELL (framework rating: STRONG BUY/BUY/HOLD/SELL)
+Position: $X | Target: $X | Stop: $X | Horizon: N weeks
+Bull case: one paragraph.
+Bear case: one paragraph.
+
+(repeat for each position; keep entries concise)
 
 URGENT ALERTS:
 TICKER — short description of the critical event (one line each)
 (or "(none)")
 
-Be direct and concise."""
+Be direct and grounded in the numbers shown."""
 
     message = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=1500,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
     )
     return next(
@@ -495,82 +786,157 @@ def parse_urgent_alerts(claude_text):
 # ---------------------------------------------------------------------------
 # Claude analysis — monthly buy screen
 # ---------------------------------------------------------------------------
-def pick_monthly_buys_with_claude(candidates, news_map):
-    """Ask Claude to pick the top 2 BUY opportunities from screened candidates.
+def pick_monthly_buys_with_claude(rich_candidates, news_map):
+    """Run the 5-pillar framework on filtered candidates and pick the top 2.
 
-    `news_map` is {ticker: [articles]} for the last 7 days.
+    `rich_candidates` is a list of rich-fundamentals dicts (already passed
+    the hard fundamental screen). `news_map` is {ticker: [articles]} for
+    the last 7 days, with sentiment attached to each headline.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    rows = []
-    for c in candidates:
-        rows.append(
-            f"{c['ticker']}: price=${format_fund(c.get('currentPrice'))}, "
-            f"PE(t/f)={format_fund(c.get('trailingPE'))}/"
-            f"{format_fund(c.get('forwardPE'))}, "
-            f"revGrowth={format_fund(c.get('revenueGrowth'))}, "
-            f"earnGrowth={format_fund(c.get('earningsGrowth'))}, "
-            f"margin={format_fund(c.get('profitMargins'))}, "
-            f"D/E={format_fund(c.get('debtToEquity'))}, "
-            f"ROE={format_fund(c.get('returnOnEquity'))}, "
-            f"analystTarget=${format_fund(c.get('targetMeanPrice'))}, "
-            f"rec={format_fund(c.get('recommendationMean'))}"
-        )
-    candidates_text = "\n".join(rows)
-
+    candidates_text = "\n\n".join(
+        rich_fundamentals_block(c) for c in rich_candidates
+    )
     news_text = "\n\n".join(
         format_news_block(c["ticker"], news_map.get(c["ticker"], []))
-        for c in candidates
+        for c in rich_candidates
     ) or "(no news available)"
 
-    prompt = f"""You are a senior equity analyst running a monthly buy screen.
+    # After 10+ closed recs, inject the bot's own historical performance
+    # so Claude can weight the most predictive factors more heavily.
+    track_record = get_track_record_for_prompt()
 
-The candidates below have ALREADY passed a strict fundamentals filter:
-revenue growth > 15%, earnings growth > 10%, profit margin > 15%,
-ROE > 15%, forward PE < 25, analyst recommendationMean < 2.0.
+    prompt = f"""{FRAMEWORK_INSTRUCTIONS}{track_record}
 
-CANDIDATES:
+The candidates below have ALREADY passed a hard fundamental filter
+(revenue growth > 15%, earnings growth > 10%, profit margin > 15%,
+ROE > 15%, forward PE < 25, recommendationMean < 2.0).
+
+CANDIDATES (rich fundamentals follow):
 {candidates_text}
 
-RECENT NEWS (last 7 days, NewsAPI headlines):
+RECENT NEWS (last 7 days, with sentiment):
 {news_text}
 
-Pick the TOP 2 BUY opportunities. Use both fundamentals AND news flow —
-strong recent news / catalyst is a tailwind; bad news (scandal, guidance
-cut, executive departure, fraud) DISQUALIFIES a candidate even if the
-fundamentals look good. For each, decide a conviction rating:
-  - STRONG → suggested position size $500
-  - MEDIUM → suggested position size $300
+Apply the 5-pillar framework to EACH candidate. Bad news (scandal,
+guidance cut, executive departure, fraud) DISQUALIFIES a candidate
+even if its fundamentals look great. Then PICK THE TOP 2 with the
+highest framework totals (must be BUY or STRONG BUY → score >= 15).
 
-For each pick, also produce:
-  - Target price (concrete dollar amount, not a percentage)
-  - Stop loss price (concrete dollar amount)
-  - Expected holding period in weeks
-  - Exactly 3 bullet point reasons grounded in the fundamentals shown
+Format the reply EXACTLY like this:
 
-Format your reply EXACTLY like this (no extra prose before or after):
+PER-CANDIDATE FRAMEWORK SCORES:
+
+=== TICKER ===
+Business Quality: X/5 — note
+Growth Trajectory: X/5 — note
+Valuation: X/5 — note
+Catalyst: X/5 — note
+Risk: X/5 — note
+Total: XX/25 → SIGNAL
+
+(repeat for each candidate; one short note per pillar)
 
 MONTHLY BUY PICKS:
 
-1) TICKER — STRONG or MEDIUM — Position: $500 or $300
-   Target: $X | Stop: $Y | Hold: N weeks
-   - reason 1
-   - reason 2
-   - reason 3
+1) TICKER — STRONG BUY or BUY — Position: $500 or $300
+   Target: $X | Stop: $Y | Horizon: N weeks
+   Bull case: one paragraph.
+   Bear case: one paragraph.
 
-2) TICKER — STRONG or MEDIUM — Position: $500 or $300
-   Target: $X | Stop: $Y | Hold: N weeks
-   - reason 1
-   - reason 2
-   - reason 3
+2) TICKER — STRONG BUY or BUY — Position: $500 or $300
+   Target: $X | Stop: $Y | Horizon: N weeks
+   Bull case: one paragraph.
+   Bear case: one paragraph.
 
-If fewer than 2 candidates are truly compelling, output only the strong
+If fewer than 2 candidates score >= 15/25, output only the qualifying
 one(s) and add a final line: "No second pick this month."
 """
 
     message = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=1500,
+        max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return next(
+        (block.text for block in message.content if hasattr(block, "text")),
+        "No analysis available",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Claude analysis — single-stock deep dive (used by /deep TICKER)
+# ---------------------------------------------------------------------------
+def analyze_stock_deep(ticker, rich, position=None, news=None):
+    """Run the full 5-pillar framework on a single ticker.
+
+    `rich`     – rich-fundamentals dict from get_rich_fundamentals(ticker)
+    `position` – optional dict (the user's holding) for position context
+    `news`     – optional list of articles (with sentiment) for the ticker
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    pos_text = "(not currently held)"
+    if position:
+        entry = position.get("entry_price")
+        shares = position.get("shares")
+        target = _safe_target(position.get("analyst_target"))
+        target_str = f"${target:.2f}" if target else "n/a"
+        cur = rich.get("currentPrice")
+        pl = (
+            ((cur - entry) / entry) * 100
+            if (cur and entry)
+            else None
+        )
+        pl_str = f"{pl:+.2f}%" if pl is not None else "n/a"
+        pos_text = (
+            f"Currently HELD — {shares} shares @ entry ${entry:.2f}, "
+            f"P/L {pl_str}, stored analyst target {target_str}"
+        )
+
+    news_text = format_news_block(ticker, news or [])
+
+    prompt = f"""{FRAMEWORK_INSTRUCTIONS}
+
+TICKER UNDER REVIEW: {ticker}
+Position context: {pos_text}
+
+RICH FUNDAMENTALS:
+{rich_fundamentals_block(rich)}
+
+RECENT NEWS (last 7 days, with sentiment):
+{news_text}
+
+Apply the 5-pillar framework to {ticker}. Be specific and grounded in
+the numbers shown above (cite PEG, growth rates, conviction, sentiment,
+etc.). Format your reply EXACTLY like this:
+
+=== {ticker} — DEEP ANALYSIS ===
+
+Business Quality: X/5 — one or two sentences
+Growth Trajectory: X/5 — one or two sentences (cite the q/q EPS trend)
+Valuation: X/5 — one or two sentences (cite PEG / fwd PE / conviction)
+Catalyst: X/5 — one or two sentences (specific event, 1–6 month window)
+Risk: X/5 — one or two sentences (single biggest risk)
+
+Total: XX/25
+Signal: STRONG BUY (20-25) / BUY (15-19) / HOLD (10-14) / SELL (<10)
+Position size: $500 / $300 / $0
+Price target: $X (your estimate, NOT just analyst average)
+Stop loss: $X (your level based on key support)
+Time horizon: N weeks
+
+Bull case:
+One paragraph, grounded in the numbers above.
+
+Bear case:
+One paragraph, grounded in the numbers above.
+"""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
     return next(
@@ -598,7 +964,10 @@ def run_analysis(chat_id):
     )
 
     tickers = list(portfolio.keys())
-    fundamentals = fetch_fundamentals_bulk(tickers)
+    # Rich fetch — superset of the basic snapshot, plus analyst conviction
+    # and quarterly earnings trend, so the 5-pillar Claude framework has
+    # everything it needs in a single bulk call.
+    fundamentals = fetch_rich_fundamentals_bulk(tickers)
 
     judged_positions = []
     forced_lines = []
@@ -743,6 +1112,20 @@ def run_analysis(chat_id):
     for line in urgent:
         send_telegram(f"🚨 *URGENT* — {line}", chat_id)
 
+    # Feedback loop — log every SELL signal the daily monitor produces.
+    try:
+        parsed = parse_framework_blocks(claude_output)
+        price_by_t = {p["ticker"]: p["current_price"] for p in judged_positions}
+        target_by_t = {p["ticker"]: p["analyst_target"] for p in judged_positions}
+        log_recommendations(
+            [b for b in parsed if (b.get("signal") or "").upper() == "SELL"],
+            price_lookup=lambda t: price_by_t.get(t),
+            analyst_lookup=lambda t: target_by_t.get(t),
+            source="daily",
+        )
+    except Exception as exc:
+        print(f"[recs] daily SELL logging failed: {exc}")
+
     # Position status block — coloured one-line summary per holding so the
     # report is scannable at a glance.
     status_lines = []
@@ -804,35 +1187,670 @@ def run_monthly_screen(chat_id):
         f" / {len(tickers)} tickers"
     )
 
-    candidates = [
+    basic_candidates = [
         f for f in fundamentals_map.values() if passes_buy_screen(f)
     ]
     print(
-        f"[monthly] {len(candidates)} stocks pass the hard fundamental screen"
+        f"[monthly] {len(basic_candidates)} stocks pass the hard fundamental "
+        f"screen"
     )
 
-    if not candidates:
+    if not basic_candidates:
         send_telegram(
             "No S&P 500 stocks passed the fundamental screen this month.",
             chat_id,
         )
         return
 
+    # Per the spec, run the FULL deep framework only on stocks that passed
+    # the hard filter. Fetch rich fundamentals (analyst conviction, EPS
+    # trend, etc.) just for those candidates.
+    cand_tickers = [c["ticker"] for c in basic_candidates]
+    rich_candidates_map = fetch_rich_fundamentals_bulk(cand_tickers)
+    rich_candidates = [
+        rich_candidates_map[t] for t in cand_tickers if t in rich_candidates_map
+    ]
+    print(
+        f"[monthly] fetched rich fundamentals for {len(rich_candidates)}"
+        f" / {len(cand_tickers)} candidates"
+    )
+
     # Fetch 7-day news for each candidate so Claude can weigh recent catalysts.
-    cand_tickers = [c["ticker"] for c in candidates]
     news_map = fetch_news_bulk(cand_tickers, days=7)
     print(
         f"[monthly] fetched news for {sum(1 for v in news_map.values() if v)}"
         f" / {len(cand_tickers)} candidates"
     )
 
-    picks = pick_monthly_buys_with_claude(candidates, news_map)
+    picks = pick_monthly_buys_with_claude(rich_candidates, news_map)
     header = (
         f"*Monthly Buy Screen*\n"
-        f"_{len(candidates)} of {len(fundamentals_map)} stocks passed "
+        f"_{len(basic_candidates)} of {len(fundamentals_map)} stocks passed "
         f"the hard filter._\n\n"
     )
     send_telegram(header + picks, chat_id)
+
+    # Feedback loop — log every monthly pick so we can grade it later.
+    try:
+        rich_by_ticker = {c["ticker"]: c for c in rich_candidates}
+        parsed_picks = parse_monthly_picks(picks)
+        log_recommendations(
+            parsed_picks,
+            price_lookup=lambda t: (rich_by_ticker.get(t, {}) or {}).get("currentPrice"),
+            analyst_lookup=lambda t: _safe_target((rich_by_ticker.get(t, {}) or {}).get("targetMeanPrice")),
+            source="monthly",
+        )
+    except Exception as exc:
+        print(f"[recs] monthly logging failed: {exc}")
+
+
+# ===========================================================================
+# Feedback loop & performance tracking
+# ===========================================================================
+# Every recommendation made by the bot (monthly pick, /deep, /buy, daily
+# SELL signal) is appended to recommendations_log.json. A daily 07:30 UTC
+# job checks open recs against their 4-week / 8-week review dates, fetches
+# the realized stock return AND the SPY benchmark return for the same
+# window, and marks the call CORRECT (beat SPY), INCORRECT (lagged SPY),
+# or STOPPED (the stock hit its stop loss inside the window).
+# ===========================================================================
+_recs_lock = threading.Lock()
+
+
+def load_recs():
+    """Lock-guarded read so concurrent writers can't expose half-written JSON."""
+    with _recs_lock:
+        return load_json(RECS_LOG_FILE, [])
+
+
+def save_recs(recs):
+    """Atomic write via temp file + os.replace — survives crash mid-write."""
+    tmp = RECS_LOG_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(recs, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, RECS_LOG_FILE)
+
+
+def _today_iso():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _add_days_iso(date_str, days):
+    return (
+        datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=days)
+    ).strftime("%Y-%m-%d")
+
+
+def _historical_close(ticker, date_str):
+    """Close price of `ticker` on `date_str` (YYYY-MM-DD).
+
+    Falls back to the next available trading day's close if `date_str`
+    was a weekend / holiday. Returns None on any failure.
+    """
+    try:
+        start = datetime.strptime(date_str, "%Y-%m-%d")
+        end = start + timedelta(days=7)
+        hist = yf.Ticker(ticker).history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=False,
+        )
+        if hist is None or hist.empty:
+            return None
+        return float(hist["Close"].iloc[0])
+    except Exception as exc:
+        print(f"[recs] historical close lookup failed for {ticker}@{date_str}: {exc}")
+        return None
+
+
+def _hit_stop_loss(ticker, start_date_str, end_date_str, stop_loss):
+    """True if `ticker` traded at/below `stop_loss` between the two dates."""
+    if not stop_loss:
+        return False
+    try:
+        hist = yf.Ticker(ticker).history(
+            start=start_date_str,
+            end=_add_days_iso(end_date_str, 1),
+            auto_adjust=False,
+        )
+        if hist is None or hist.empty:
+            return False
+        return float(hist["Low"].min()) <= float(stop_loss)
+    except Exception:
+        return False
+
+
+# --- Framework output parsing -----------------------------------------------
+# Claude often wraps fields in `**bold**`; the regex below tolerates that.
+_FRAMEWORK_BLOCK_RE = re.compile(
+    r"===\s*([A-Z][A-Z0-9.\-]{0,9})\s*(?:[—\-]\s*DEEP ANALYSIS\s*)?===\s*"
+    r"(.*?)(?=^===\s*[A-Z]|^MONTHLY BUY PICKS|^URGENT ALERTS|^PER-CANDIDATE|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
+_TOTAL_RE = re.compile(r"Total:\s*\**\s*(\d+)\s*/\s*25", re.IGNORECASE)
+_SIGNAL_RE = re.compile(
+    r"Signal:?\s*\**\s*(STRONG\s*BUY|BUY|HOLD|SELL)",
+    re.IGNORECASE,
+)
+_TARGET_RE = re.compile(
+    r"(?:Price\s+target|Target):?\s*\**\s*\$?\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_STOP_RE = re.compile(
+    r"Stop(?:\s*loss)?:?\s*\**\s*\$?\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_BULL_RE = re.compile(
+    r"Bull\s*case:?\s*\**\s*\n?(.+?)(?=\n\s*\**\s*Bear\s*case|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+_BEAR_RE = re.compile(
+    r"Bear\s*case:?\s*\**\s*\n?(.+?)(?=^\s*===|^\s*---|\Z)",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
+)
+# Monthly picks come in "1) TICKER — SIGNAL — Position: $X" or "1." form,
+# with em-dash, en-dash, or hyphen as the separator. Tolerate **bold**.
+_PICK_RE = re.compile(
+    r"^\s*\d+[\)\.]\s*\**\s*([A-Z][A-Z0-9.\-]{0,9})\**\s*[—–\-]+\s*\**\s*"
+    r"(STRONG\s*BUY|BUY)\b(.*?)(?=^\s*\d+[\)\.]|^\s*If fewer|^\s*No second|\Z)",
+    re.DOTALL | re.MULTILINE | re.IGNORECASE,
+)
+
+
+def parse_monthly_picks(text):
+    """Extract the top picks section AND merge with per-candidate scores.
+
+    Returns list of dicts with the same shape as parse_framework_blocks().
+    """
+    if not text:
+        return []
+    # Per-candidate scores live in === TICKER === blocks earlier in the text.
+    score_by_ticker = {
+        b["ticker"]: b for b in parse_framework_blocks(text)
+    }
+    out = []
+    for m in _PICK_RE.finditer(text):
+        ticker = m.group(1).upper()
+        signal = m.group(2).upper().replace("  ", " ")
+        body = m.group(3)
+        target = _TARGET_RE.search(body)
+        stop = _STOP_RE.search(body)
+        bull = _BULL_RE.search(body)
+        bear = _BEAR_RE.search(body)
+        scored = score_by_ticker.get(ticker, {})
+        out.append({
+            "ticker": ticker,
+            "total_score": scored.get("total_score"),
+            "signal": signal,
+            "claude_target": _parse_money(target.group(1)) if target else None,
+            "stop_loss": _parse_money(stop.group(1)) if stop else None,
+            "bull_case": bull.group(1).strip() if bull else None,
+            "bear_case": bear.group(1).strip() if bear else None,
+        })
+    return out
+
+
+def _parse_money(s):
+    if s is None:
+        return None
+    try:
+        return float(s.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def parse_framework_blocks(text):
+    """Extract every `=== TICKER ===` framework block from Claude output.
+
+    Returns list of dicts: {ticker, total_score, signal, claude_target,
+    stop_loss, bull_case, bear_case}. Missing fields are None.
+    """
+    if not text:
+        return []
+    out = []
+    for m in _FRAMEWORK_BLOCK_RE.finditer(text):
+        ticker = m.group(1).upper()
+        body = m.group(2)
+        total = _TOTAL_RE.search(body)
+        signal = _SIGNAL_RE.search(body)
+        target = _TARGET_RE.search(body)
+        stop = _STOP_RE.search(body)
+        bull = _BULL_RE.search(body)
+        bear = _BEAR_RE.search(body)
+        out.append({
+            "ticker": ticker,
+            "total_score": int(total.group(1)) if total else None,
+            "signal": signal.group(1).upper().replace("  ", " ") if signal else None,
+            "claude_target": _parse_money(target.group(1)) if target else None,
+            "stop_loss": _parse_money(stop.group(1)) if stop else None,
+            "bull_case": bull.group(1).strip() if bull else None,
+            "bear_case": bear.group(1).strip() if bear else None,
+        })
+    return out
+
+
+def _make_rec(ticker, parsed, price, analyst_target, source):
+    """Construct one recommendation dict from a parsed framework block."""
+    today = _today_iso()
+    return {
+        "id": f"{today}-{ticker}-{int(time.time())}",
+        "date": today,
+        "ticker": ticker,
+        "source": source,
+        "signal": parsed.get("signal"),
+        "framework_score": parsed.get("total_score"),
+        "price_at_recommendation": price,
+        "claude_target": parsed.get("claude_target"),
+        "analyst_target": analyst_target,
+        "stop_loss": parsed.get("stop_loss"),
+        "bull_case": parsed.get("bull_case"),
+        "bear_case": parsed.get("bear_case"),
+        "sp500_at_recommendation": _historical_close("SPY", today),
+        "status": "open",
+        "review_4w_date": _add_days_iso(today, REVIEW_4W_DAYS),
+        "review_8w_date": _add_days_iso(today, REVIEW_8W_DAYS),
+        "review_4w_price": None, "review_4w_return": None,
+        "review_4w_sp500_return": None, "review_4w_result": None,
+        "review_8w_price": None, "review_8w_return": None,
+        "review_8w_sp500_return": None, "review_8w_result": None,
+    }
+
+
+def log_recommendations(parsed_blocks, price_lookup, analyst_lookup, source,
+                        signals_to_log=None):
+    """Append framework blocks to the rec log, optionally filtered by signal.
+
+    `price_lookup(ticker)` returns the price-at-recommendation.
+    `analyst_lookup(ticker)` returns the analyst target (or None).
+    `signals_to_log` is a set like {"STRONG BUY", "BUY"}; None = log all.
+    """
+    if not parsed_blocks:
+        return 0
+    added = 0
+    with _recs_lock:
+        recs = load_recs()
+        for p in parsed_blocks:
+            sig = (p.get("signal") or "").upper()
+            if signals_to_log is not None and sig not in signals_to_log:
+                continue
+            t = p["ticker"]
+            try:
+                rec = _make_rec(
+                    t, p, price_lookup(t), analyst_lookup(t), source,
+                )
+            except Exception as exc:
+                print(f"[recs] failed to build rec for {t}: {exc}")
+                continue
+            recs.append(rec)
+            added += 1
+        if added:
+            save_recs(recs)
+    print(f"[recs] logged {added} new recommendation(s) from source={source}")
+    return added
+
+
+# --- Daily review check (07:30 UTC) -----------------------------------------
+def _classify_review_result(rec, current_price, sp500_now, window_end):
+    """Return ('CORRECT'|'INCORRECT'|'STOPPED', stock_ret%, sp500_ret%).
+
+    Returns (None, None, None) if any required input is missing — the
+    review is then deferred so we don't bias win-rate with a bogus
+    SPY=0% baseline.
+    """
+    rec_price = rec["price_at_recommendation"]
+    sp_at = rec["sp500_at_recommendation"]
+    stop = rec.get("stop_loss")
+    if rec_price is None or current_price is None:
+        return None, None, None
+    if not (sp500_now and sp_at):
+        # No clean benchmark → defer; we'll retry next day.
+        return None, None, None
+    stock_ret = ((current_price - rec_price) / rec_price) * 100
+    sp_ret = ((sp500_now - sp_at) / sp_at) * 100
+    # Stop-loss check supersedes the SPY comparison.
+    if stop and _hit_stop_loss(rec["ticker"], rec["date"], window_end, stop):
+        return "STOPPED", stock_ret, sp_ret
+    if stock_ret > sp_ret:
+        return "CORRECT", stock_ret, sp_ret
+    return "INCORRECT", stock_ret, sp_ret
+
+
+def check_recommendation_reviews(chat_id=None):
+    """Daily 07:30 UTC sweep — review any recs whose 4w/8w date has arrived."""
+    today = _today_iso()
+    with _recs_lock:
+        recs = load_recs()
+        if not recs:
+            return
+        spy_now = _historical_close("SPY", today) or get_current_price("SPY")
+        any_change = False
+        for rec in recs:
+            if rec.get("status") == "closed":
+                continue
+
+            # 4-week review (only fires once)
+            if (
+                rec.get("review_4w_result") is None
+                and rec["review_4w_date"] <= today
+            ):
+                cur = get_current_price(rec["ticker"])
+                window_end = today
+                result, stock_ret, sp_ret = _classify_review_result(
+                    rec, cur, spy_now, window_end,
+                )
+                if result is not None:
+                    rec["review_4w_price"] = cur
+                    rec["review_4w_return"] = round(stock_ret, 2)
+                    rec["review_4w_sp500_return"] = round(sp_ret, 2)
+                    rec["review_4w_result"] = result
+                    any_change = True
+                    if chat_id:
+                        send_telegram(
+                            f"📊 *4-week review — {rec['ticker']}* "
+                            f"({rec['signal']} on {rec['date']})\n"
+                            f"Stock: {stock_ret:+.2f}%  |  "
+                            f"SPY: {sp_ret:+.2f}%  →  *{result}*",
+                            chat_id,
+                        )
+
+            # 8-week review (closes the rec)
+            if (
+                rec.get("review_8w_result") is None
+                and rec["review_8w_date"] <= today
+            ):
+                cur = get_current_price(rec["ticker"])
+                window_end = today
+                result, stock_ret, sp_ret = _classify_review_result(
+                    rec, cur, spy_now, window_end,
+                )
+                if result is not None:
+                    rec["review_8w_price"] = cur
+                    rec["review_8w_return"] = round(stock_ret, 2)
+                    rec["review_8w_sp500_return"] = round(sp_ret, 2)
+                    rec["review_8w_result"] = result
+                    rec["status"] = "closed"
+                    any_change = True
+                    if chat_id:
+                        send_telegram(
+                            f"📊 *8-week FINAL — {rec['ticker']}* "
+                            f"({rec['signal']} on {rec['date']})\n"
+                            f"Stock: {stock_ret:+.2f}%  |  "
+                            f"SPY: {sp_ret:+.2f}%  →  *{result}* (closed)",
+                            chat_id,
+                        )
+        if any_change:
+            save_recs(recs)
+
+
+# --- Performance & review commands ------------------------------------------
+def _final_result(rec):
+    """Use 8w result if present, otherwise 4w."""
+    return rec.get("review_8w_result") or rec.get("review_4w_result")
+
+
+def _final_return(rec):
+    if rec.get("review_8w_return") is not None:
+        return rec["review_8w_return"], rec.get("review_8w_sp500_return", 0)
+    if rec.get("review_4w_return") is not None:
+        return rec["review_4w_return"], rec.get("review_4w_sp500_return", 0)
+    return None, None
+
+
+def compute_performance_stats():
+    """Return aggregated stats over CLOSED (8-week-finalized) recs only.
+
+    Mixing 4w-interim and 8w-final returns would distort best/worst and
+    avg, so the headline metrics use closed positions exclusively.
+    Open + 4w-only recs still appear in `/review` and "Recent calls".
+    """
+    recs = load_recs()
+    reviewed = [r for r in recs if r.get("status") == "closed"]
+    total = len(reviewed)
+    wins = sum(1 for r in reviewed if _final_result(r) == "CORRECT")
+    stopped = sum(1 for r in reviewed if _final_result(r) == "STOPPED")
+    avg_stock = (
+        sum(_final_return(r)[0] for r in reviewed) / total if total else 0.0
+    )
+    avg_sp = (
+        sum(_final_return(r)[1] for r in reviewed) / total if total else 0.0
+    )
+    best = worst = None
+    for r in reviewed:
+        ret, _ = _final_return(r)
+        if ret is None:
+            continue
+        if best is None or ret > best[1]:
+            best = (r["ticker"], ret, r["date"])
+        if worst is None or ret < worst[1]:
+            worst = (r["ticker"], ret, r["date"])
+
+    def _winrate_for(filter_fn):
+        sub = [r for r in reviewed if filter_fn(r)]
+        if not sub:
+            return None, 0
+        w = sum(1 for r in sub if _final_result(r) == "CORRECT")
+        return (w / len(sub)) * 100, len(sub)
+
+    sb_wr = _winrate_for(lambda r: (r.get("signal") or "").upper() == "STRONG BUY")
+    b_wr = _winrate_for(lambda r: (r.get("signal") or "").upper() == "BUY")
+    high_wr = _winrate_for(
+        lambda r: r.get("framework_score") and r["framework_score"] >= 20
+    )
+    mid_wr = _winrate_for(
+        lambda r: r.get("framework_score")
+        and 15 <= r["framework_score"] < 20
+    )
+
+    return {
+        "total": total,
+        "wins": wins,
+        "stopped": stopped,
+        "win_rate": (wins / total * 100) if total else 0.0,
+        "avg_stock": avg_stock,
+        "avg_sp": avg_sp,
+        "best": best,
+        "worst": worst,
+        "strong_buy_wr": sb_wr,
+        "buy_wr": b_wr,
+        "high_score_wr": high_wr,
+        "mid_score_wr": mid_wr,
+        "all_recs": recs,
+        "reviewed": reviewed,
+    }
+
+
+def handle_performance(chat_id):
+    s = compute_performance_stats()
+    if s["total"] == 0:
+        send_telegram(
+            "*Performance*\n_No reviewed recommendations yet._\n"
+            "Recommendations are evaluated at 4 and 8 week marks.",
+            chat_id,
+        )
+        return
+    lines = [
+        "*Performance — overall track record*",
+        f"Reviewed: {s['total']}  |  Wins: {s['wins']}  "
+        f"|  Stopped: {s['stopped']}",
+        f"Win rate vs SPY: *{s['win_rate']:.1f}%*",
+        f"Avg return: stock {s['avg_stock']:+.2f}%  vs  "
+        f"SPY {s['avg_sp']:+.2f}%",
+    ]
+    if s["best"]:
+        t, r, d = s["best"]
+        lines.append(f"Best call: *{t}* {r:+.2f}% (rec'd {d})")
+    if s["worst"]:
+        t, r, d = s["worst"]
+        lines.append(f"Worst call: *{t}* {r:+.2f}% (rec'd {d})")
+
+    lines.append("")
+    lines.append("*By signal type:*")
+
+    def _fmt_wr(wr):
+        if wr[0] is None:
+            return "n/a"
+        return f"{wr[0]:.1f}% (N={wr[1]})"
+    lines.append(f"STRONG BUY: {_fmt_wr(s['strong_buy_wr'])}")
+    lines.append(f"BUY: {_fmt_wr(s['buy_wr'])}")
+    lines.append("")
+    lines.append("*By framework score:*")
+    lines.append(f"Score 20–25: {_fmt_wr(s['high_score_wr'])}")
+    lines.append(f"Score 15–19: {_fmt_wr(s['mid_score_wr'])}")
+
+    lines.append("")
+    lines.append("*Recent calls (last 5):*")
+    for r in s["all_recs"][-5:]:
+        ret, _ = _final_return(r)
+        ret_str = f"{ret:+.2f}%" if ret is not None else "open"
+        result = _final_result(r) or r.get("status", "open")
+        lines.append(
+            f"• {r['date']} *{r['ticker']}* — {r.get('signal') or '?'} → "
+            f"{result} ({ret_str})"
+        )
+    send_telegram("\n".join(lines), chat_id)
+
+
+def handle_review(chat_id):
+    """`/review` — show every open recommendation with countdowns."""
+    recs = load_recs()
+    open_recs = [r for r in recs if r.get("status") != "closed"]
+    if not open_recs:
+        send_telegram(
+            "*Open recommendations*\n_None — log is empty or all closed._",
+            chat_id,
+        )
+        return
+    today_dt = datetime.strptime(_today_iso(), "%Y-%m-%d")
+    lines = [f"*Open recommendations ({len(open_recs)})*", ""]
+    for r in open_recs:
+        cur = get_current_price(r["ticker"])
+        rec_price = r.get("price_at_recommendation")
+        if cur and rec_price:
+            ret = ((cur - rec_price) / rec_price) * 100
+            ret_str = f"{ret:+.2f}% so far"
+            cur_str = f"${cur:.2f}"
+        else:
+            ret_str = "n/a"
+            cur_str = "n/a"
+        d4 = (datetime.strptime(r["review_4w_date"], "%Y-%m-%d") - today_dt).days
+        d8 = (datetime.strptime(r["review_8w_date"], "%Y-%m-%d") - today_dt).days
+        d4_label = (
+            r.get("review_4w_result") or
+            (f"in {d4}d" if d4 > 0 else "due now" if d4 == 0 else f"{abs(d4)}d overdue")
+        )
+        d8_label = (
+            r.get("review_8w_result") or
+            (f"in {d8}d" if d8 > 0 else "due now" if d8 == 0 else f"{abs(d8)}d overdue")
+        )
+        lines.append(
+            f"*{r['ticker']}* ({r.get('signal') or '?'}, "
+            f"score {r.get('framework_score') or '?'}/25) — {r['date']}\n"
+            f"  Rec ${rec_price:.2f} → now {cur_str}  |  {ret_str}\n"
+            f"  4w review: {d4_label}  |  8w review: {d8_label}"
+        )
+    send_telegram("\n\n".join(lines), chat_id)
+
+
+# --- Weekly summary (Sunday 08:00 UTC) --------------------------------------
+def weekly_performance_summary(chat_id):
+    """Sunday 08:00 UTC — recap of any reviews this week + one-line Claude take."""
+    recs = load_recs()
+    if not recs:
+        return
+    today = _today_iso()
+    week_ago = _add_days_iso(today, -7)
+    reviewed_this_week = [
+        r for r in recs
+        if (r.get("review_4w_result") and r["review_4w_date"] >= week_ago and r["review_4w_date"] <= today)
+        or (r.get("review_8w_result") and r["review_8w_date"] >= week_ago and r["review_8w_date"] <= today)
+    ]
+    s = compute_performance_stats()
+
+    lines = ["*Weekly Performance Summary*", ""]
+    if reviewed_this_week:
+        lines.append("*Reviewed this week:*")
+        for r in reviewed_this_week:
+            result = _final_result(r) or "—"
+            ret, sp = _final_return(r)
+            ret_str = f"{ret:+.2f}% vs SPY {sp:+.2f}%" if ret is not None else ""
+            lines.append(
+                f"• *{r['ticker']}* ({r.get('signal')}, "
+                f"{r['date']}) → {result}  {ret_str}"
+            )
+        lines.append("")
+    else:
+        lines.append("_No new reviews this week._")
+        lines.append("")
+
+    if s["total"] > 0:
+        beating = "BEATING" if s["avg_stock"] > s["avg_sp"] else "LAGGING"
+        lines.append(f"*Running win rate:* {s['win_rate']:.1f}% over {s['total']} reviews")
+        lines.append(
+            f"*Average return:* {s['avg_stock']:+.2f}% vs SPY "
+            f"{s['avg_sp']:+.2f}% — {beating} the market"
+        )
+
+        # One-line Claude commentary
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            msg = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=150,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"In ONE sentence, comment on what these stock-picking "
+                        f"results suggest about the strategy: "
+                        f"{s['total']} reviewed picks, {s['win_rate']:.0f}% "
+                        f"beat SPY, avg stock return {s['avg_stock']:+.2f}% vs "
+                        f"SPY {s['avg_sp']:+.2f}%. STRONG BUY win rate "
+                        f"{s['strong_buy_wr'][0] if s['strong_buy_wr'][0] is not None else 'n/a'}, "
+                        f"BUY win rate "
+                        f"{s['buy_wr'][0] if s['buy_wr'][0] is not None else 'n/a'}. "
+                        f"Be direct and specific."
+                    ),
+                }],
+            )
+            commentary = next(
+                (b.text for b in msg.content if hasattr(b, "text")),
+                "",
+            ).strip()
+            if commentary:
+                lines.append("")
+                lines.append(f"_Claude says: {commentary}_")
+        except Exception as exc:
+            print(f"[weekly] commentary failed: {exc}")
+
+    send_telegram("\n".join(lines), chat_id)
+
+
+def get_track_record_for_prompt():
+    """Adaptive context block for the monthly prompt — only after 10+ closes."""
+    recs = load_recs()
+    closed = [r for r in recs if r.get("status") == "closed"]
+    if len(closed) < 10:
+        return ""
+    s = compute_performance_stats()
+    sb = s["strong_buy_wr"][0]
+    b = s["buy_wr"][0]
+    high = s["high_score_wr"][0]
+    mid = s["mid_score_wr"][0]
+
+    factor = "framework score" if (
+        high is not None and mid is not None and high > mid
+    ) else "signal type"
+    return (
+        f"\n\nHISTORICAL TRACK RECORD ({len(closed)} closed recs):\n"
+        f"- Overall win rate vs SPY: {s['win_rate']:.1f}%\n"
+        f"- Avg return: stock {s['avg_stock']:+.2f}% vs SPY {s['avg_sp']:+.2f}%\n"
+        f"- STRONG BUY win rate: {sb if sb is not None else 'n/a'}%  "
+        f"|  BUY win rate: {b if b is not None else 'n/a'}%\n"
+        f"- Score 20-25 win rate: {high if high is not None else 'n/a'}%  "
+        f"|  Score 15-19 win rate: {mid if mid is not None else 'n/a'}%\n"
+        f"Most predictive factor so far: {factor}. Weight it heavily.\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +1898,34 @@ def handle_buy(args, chat_id):
             f"_Analyst target unavailable._",
             chat_id,
         )
+
+    # Feedback loop — kick off a deep analysis on the new position so the
+    # /buy decision gets logged like any other recommendation. Runs in the
+    # background so the user gets the confirmation immediately.
+    def _buy_deep_log():
+        try:
+            rich = get_rich_fundamentals(ticker)
+            if not rich:
+                return
+            news = get_stock_news(ticker, days=7, page_size=5)
+            position = load_portfolio().get(ticker)
+            result = analyze_stock_deep(ticker, rich, position, news)
+            send_telegram(
+                f"*Deep analysis logged for {ticker}:*\n\n{result}",
+                chat_id,
+            )
+            parsed = parse_framework_blocks(result)
+            log_recommendations(
+                parsed,
+                # Use the user's actual fill price as the rec baseline.
+                price_lookup=lambda _t: price,
+                analyst_lookup=lambda _t: target,
+                source="buy",
+            )
+        except Exception as exc:
+            print(f"[/buy {ticker}] deep-log failed: {exc}")
+
+    Thread(target=_buy_deep_log, daemon=True).start()
 
 
 def handle_sell(args, chat_id):
@@ -1130,6 +2176,62 @@ def handle_portfolio(chat_id):
     send_telegram("\n".join(lines), chat_id)
 
 
+def handle_deep(args, chat_id):
+    """`/deep TICKER` — run the full 5-pillar framework on any stock."""
+    if not args:
+        send_telegram(
+            "Usage: /deep TICKER\nExample: /deep NVDA",
+            chat_id,
+        )
+        return
+    ticker = args[0].upper()
+    send_telegram(
+        f"*Running deep analysis on {ticker}...*\n"
+        "Pulling rich fundamentals, earnings trend & news. ~20s.",
+        chat_id,
+    )
+
+    def _run():
+        try:
+            rich = get_rich_fundamentals(ticker)
+            if not rich or not rich.get("currentPrice"):
+                send_telegram(
+                    f"Could not fetch fundamentals for *{ticker}*. "
+                    f"Check the ticker spelling.",
+                    chat_id,
+                )
+                return
+            portfolio = load_portfolio()
+            position = portfolio.get(ticker)
+            news = get_stock_news(ticker, days=7, page_size=5)
+            result = analyze_stock_deep(ticker, rich, position, news)
+            news_summary = (
+                f"News sentiment: {sentiment_label(aggregate_sentiment(news))} "
+                f"({len(news)} headlines, last 7d)"
+                if news else "News: (no headlines available)"
+            )
+            send_telegram(f"{result}\n\n_{news_summary}_", chat_id)
+            # Feedback loop — log this on-demand recommendation.
+            try:
+                parsed = parse_framework_blocks(result)
+                log_recommendations(
+                    parsed,
+                    price_lookup=lambda _t: rich.get("currentPrice"),
+                    analyst_lookup=lambda _t: _safe_target(rich.get("targetMeanPrice")),
+                    source="deep",
+                )
+            except Exception as exc:
+                print(f"[recs] /deep logging failed: {exc}")
+        except Exception as exc:
+            print(f"[/deep {ticker}] error: {exc}")
+            send_telegram(
+                f"Deep analysis for *{ticker}* failed: {exc}",
+                chat_id,
+            )
+
+    Thread(target=_run, daemon=True).start()
+
+
 def handle_start(chat_id):
     send_telegram(
         "Welcome to *Portfolio Bot*\n\n"
@@ -1140,8 +2242,11 @@ def handle_start(chat_id):
         "`/portfolio` — holdings with live P&L, analyst target & upside\n"
         "`/health` — portfolio health score (0–10) with breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
-        "`/analyze` — daily HOLD/SELL review on holdings\n"
-        "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
+        "`/analyze` — daily 5-pillar review on holdings\n"
+        "`/deep TICKER` — full 5-pillar deep dive on any stock\n"
+        "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n"
+        "`/review` — open recommendations + 4w/8w countdowns\n"
+        "`/performance` — track record vs S&P 500\n\n"
         "_Hard SELL rules:_\n"
         "_• -7% stop loss (capital protection)_\n"
         "_• price ≥ analyst target (above fair value — strong sell)_\n"
@@ -1207,6 +2312,12 @@ def poll_telegram():
                         handle_earnings(chat_id)
                     elif cmd == "/health":
                         handle_health(chat_id)
+                    elif cmd == "/performance":
+                        handle_performance(chat_id)
+                    elif cmd == "/review":
+                        handle_review(chat_id)
+                    elif cmd == "/deep":
+                        handle_deep(args, chat_id)
                     elif cmd == "/monthly":
                         send_telegram(
                             "Monthly buy screen started, please wait...",
@@ -1823,6 +2934,30 @@ def scheduled_earnings_check():
         print(f"[scheduled] earnings check failed: {exc}")
 
 
+def scheduled_recommendation_review():
+    """Daily 07:30 UTC — grade any recs hitting their 4w / 8w window."""
+    chat_id = recall_chat()
+    print("[scheduled] running recommendation review check")
+    try:
+        check_recommendation_reviews(chat_id)
+    except Exception as exc:
+        print(f"[scheduled] recommendation review failed: {exc}")
+
+
+def scheduled_weekly_summary():
+    """Sunday 08:00 UTC — push a weekly performance recap."""
+    if datetime.utcnow().weekday() != 6:   # 6 == Sunday
+        return
+    chat_id = recall_chat()
+    if chat_id is None:
+        return
+    print("[scheduled] running weekly performance summary")
+    try:
+        weekly_performance_summary(chat_id)
+    except Exception as exc:
+        print(f"[scheduled] weekly summary failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Scheduled daily run at 09:00 UTC
 # ---------------------------------------------------------------------------
@@ -1842,7 +2977,9 @@ def scheduled_run():
     run_analysis(chat_id)
 
 
+schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
+schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
 schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 
