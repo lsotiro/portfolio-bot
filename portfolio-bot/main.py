@@ -7,8 +7,11 @@ Commands you can send the bot:
   /portfolio                 show current holdings with live P&L
   /analyze                   run the daily HOLD/SELL review on holdings
   /monthly                   run the monthly S&P 500 buy screen
+  /earnings                  list upcoming earnings (next 30 days)
 
-Once a day at 09:00 UTC the bot also runs /analyze automatically.
+Daily schedule (UTC):
+  08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
+  09:00 — full /analyze portfolio review
 
 Hard rules applied to every holding before Claude is consulted:
   - Stop loss        : forced SELL if down 7% from entry (capital protection)
@@ -23,8 +26,12 @@ on each position — there is no flat % target. Targets are fetched when a
 position is added and refreshed on the 1st of every month.
 """
 
+import csv
+import io
 import json
+import math
 import os
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,6 +95,15 @@ SCREEN_MIN_EARNINGS_GROWTH = 0.10    # > 10%
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
+
+# How many days before earnings we send a heads-up alert.
+EARNINGS_ALERT_DAYS = 3
+# Maximum lookahead window for the manual /earnings command.
+EARNINGS_LOOKAHEAD_DAYS = 30
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+# Free-tier AV is 5 requests/minute. Space calls 13s apart to stay safe.
+ALPHA_VANTAGE_MIN_INTERVAL_SEC = 13.0
 
 PORTFOLIO_FILE = "portfolio.json"   # where positions are stored
 LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
@@ -1109,6 +1125,7 @@ def handle_start(chat_id):
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
         "`/portfolio` — holdings with live P&L, analyst target & upside\n"
+        "`/earnings` — upcoming earnings dates (next 30 days)\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
         "_Hard SELL rules:_\n"
@@ -1172,6 +1189,8 @@ def poll_telegram():
                         Thread(
                             target=run_analysis, args=(chat_id,), daemon=True
                         ).start()
+                    elif cmd == "/earnings":
+                        handle_earnings(chat_id)
                     elif cmd == "/monthly":
                         send_telegram(
                             "Monthly buy screen started, please wait...",
@@ -1257,6 +1276,331 @@ def refresh_analyst_targets(chat_id=None, notify=True):
 
 
 # ---------------------------------------------------------------------------
+# Earnings calendar — Alpha Vantage + yfinance
+# ---------------------------------------------------------------------------
+_AV_LOCK = threading.Lock()
+_AV_LAST_CALL_TS = 0.0
+
+
+def _av_throttle():
+    """Block until at least ALPHA_VANTAGE_MIN_INTERVAL_SEC has passed since the
+    previous call. Keeps us under the 5 req/min free-tier limit even when a
+    sweep iterates over every holding back-to-back.
+    """
+    global _AV_LAST_CALL_TS
+    with _AV_LOCK:
+        wait = ALPHA_VANTAGE_MIN_INTERVAL_SEC - (time.time() - _AV_LAST_CALL_TS)
+        if wait > 0:
+            time.sleep(wait)
+        _AV_LAST_CALL_TS = time.time()
+
+
+def _safe_float(value):
+    """Return float(value) or None for NaN / non-numeric / missing."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return v
+
+
+def fetch_earnings_calendar(ticker, horizon="3month"):
+    """Fetch upcoming earnings for `ticker` from Alpha Vantage.
+
+    Alpha Vantage's EARNINGS_CALENDAR endpoint returns CSV. Returns a list
+    of dicts: {report_date (date), fiscal_date (str), estimate (float|None),
+    currency (str)}. Returns [] on any error or if the key isn't configured.
+    """
+    if not ALPHA_VANTAGE_KEY:
+        return []
+    _av_throttle()
+    try:
+        resp = requests.get(
+            ALPHA_VANTAGE_URL,
+            params={
+                "function": "EARNINGS_CALENDAR",
+                "symbol": ticker,
+                "horizon": horizon,
+                "apikey": ALPHA_VANTAGE_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        text = resp.text.strip()
+        # Alpha Vantage returns JSON for errors / rate limits, CSV for data.
+        if not text or text.startswith("{") or text.lower().startswith("note") \
+                or text.lower().startswith("information"):
+            print(f"[earnings] {ticker}: AV non-CSV response: {text[:120]}")
+            return []
+        reader = csv.DictReader(io.StringIO(text))
+        out = []
+        for row in reader:
+            try:
+                report_date = datetime.strptime(
+                    row["reportDate"], "%Y-%m-%d"
+                ).date()
+            except (KeyError, ValueError):
+                continue
+            est_raw = (row.get("estimate") or "").strip()
+            try:
+                est_val = float(est_raw) if est_raw else None
+            except ValueError:
+                est_val = None
+            out.append(
+                {
+                    "report_date": report_date,
+                    "fiscal_date": row.get("fiscalDateEnding", ""),
+                    "estimate": est_val,
+                    "currency": row.get("currency", ""),
+                }
+            )
+        return out
+    except Exception as exc:
+        print(f"[earnings] {ticker}: AV fetch failed: {exc}")
+        return []
+
+
+def get_next_earnings(ticker, horizon="3month"):
+    """Return next upcoming earnings dict (with `days_until`) or None."""
+    today = datetime.utcnow().date()
+    cal = fetch_earnings_calendar(ticker, horizon)
+    upcoming = sorted(
+        (e for e in cal if e["report_date"] >= today),
+        key=lambda x: x["report_date"],
+    )
+    if not upcoming:
+        return None
+    nxt = dict(upcoming[0])
+    nxt["days_until"] = (nxt["report_date"] - today).days
+    return nxt
+
+
+def get_last_quarter_eps(ticker):
+    """Return a beat/miss summary for the most recent reported quarter, or None.
+
+    Uses yfinance's earnings_dates frame which contains both estimates and
+    actuals. We pick the most recent row that has a Reported EPS value.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        ed = t.get_earnings_dates(limit=12)
+        if ed is None or ed.empty:
+            return None
+        if "Reported EPS" not in ed.columns:
+            return None
+        reported = ed.dropna(subset=["Reported EPS"])
+        if reported.empty:
+            return None
+        latest = reported.sort_index(ascending=False).iloc[0]
+        actual = _safe_float(latest.get("Reported EPS"))
+        est = _safe_float(latest.get("EPS Estimate"))
+        if actual is None:
+            return None
+        if est is None:
+            return f"reported ${actual:.2f}"
+        verdict = "beat" if actual > est else (
+            "missed" if actual < est else "met"
+        )
+        return f"{verdict} (${actual:.2f} vs ${est:.2f} est)"
+    except Exception as exc:
+        print(f"[earnings] {ticker}: history fetch failed: {exc}")
+        return None
+
+
+def check_earnings_calendar(chat_id, threshold_days=EARNINGS_ALERT_DAYS):
+    """Scan all holdings; send a Telegram alert for each one with earnings
+    inside the threshold window.
+
+    Returns the list of alerted tickers.
+    """
+    portfolio = load_portfolio()
+    if not portfolio:
+        return []
+    if not ALPHA_VANTAGE_KEY:
+        send_telegram(
+            "_Earnings check skipped — ALPHA_VANTAGE_KEY not configured._",
+            chat_id,
+        )
+        return []
+
+    alerted = []
+    for ticker, pos in portfolio.items():
+        nxt = get_next_earnings(ticker)
+        if not nxt:
+            continue
+        days = nxt["days_until"]
+        if days > threshold_days:
+            continue
+
+        # Position size + P&L
+        shares = pos["shares"]
+        entry = pos["entry_price"]
+        current = get_current_price(ticker)
+        if current is not None:
+            pl_dollar = (current - entry) * shares
+            pl_pct = ((current - entry) / entry) * 100
+            sign = "+" if pl_dollar >= 0 else "-"
+            pl_line = (
+                f"P&L: {sign}${abs(pl_dollar):.2f} "
+                f"({sign}{abs(pl_pct):.1f}%)"
+            )
+        else:
+            pl_line = "P&L: _price unavailable_"
+
+        # Analyst EPS estimate — prefer Alpha Vantage's, fall back to yfinance.
+        # Both values pass through _safe_float to reject NaN / non-numeric.
+        eps_est = _safe_float(nxt.get("estimate"))
+        forward_eps = None
+        if eps_est is None:
+            try:
+                forward_eps = _safe_float(
+                    yf.Ticker(ticker).info.get("forwardEps")
+                )
+            except Exception:
+                forward_eps = None
+        if eps_est is not None:
+            eps_line = f"Analyst EPS estimate: ${eps_est:.2f}"
+        elif forward_eps is not None:
+            eps_line = f"Forward EPS (yfinance): ${forward_eps:.2f}"
+        else:
+            eps_line = "Analyst EPS estimate: _n/a_"
+
+        # Beat / miss last quarter — wrap in try so one bad ticker can't
+        # abort the whole sweep.
+        try:
+            last_q = get_last_quarter_eps(ticker)
+        except Exception as exc:
+            print(f"[earnings] {ticker}: last-quarter lookup failed: {exc}")
+            last_q = None
+        last_line = (
+            f"Last quarter: {last_q}" if last_q else "Last quarter: _n/a_"
+        )
+
+        when = (
+            "today" if days == 0
+            else "tomorrow" if days == 1
+            else f"in {days} days"
+        )
+
+        msg = (
+            f"⚠️ *EARNINGS ALERT*\n\n"
+            f"*{ticker}* — earnings {when} ({nxt['report_date'].isoformat()})\n"
+            f"Position: {shares} shares @ ${entry:.2f}\n"
+            f"{pl_line}\n"
+            f"{eps_line}\n"
+            f"{last_line}\n\n"
+            f"_Three options to consider:_\n"
+            f"• *Hold* through earnings — full upside, full downside risk\n"
+            f"• *Trim 50%* to lock partial gains — `/trim {ticker}`\n"
+            f"• *Tighten stop / exit* if you want zero earnings risk — "
+            f"`/sell {ticker}`"
+        )
+        try:
+            send_telegram(msg, chat_id)
+            alerted.append(ticker)
+        except Exception as exc:
+            print(f"[earnings] {ticker}: send failed: {exc}")
+
+    return alerted
+
+
+def handle_earnings(chat_id):
+    """Manual /earnings — split holdings into three clear buckets:
+    upcoming within 30 days, scheduled beyond 30 days, and data unavailable.
+    """
+    portfolio = load_portfolio()
+    if not portfolio:
+        send_telegram("Your portfolio is empty.", chat_id)
+        return
+    if not ALPHA_VANTAGE_KEY:
+        send_telegram(
+            "_Earnings lookup unavailable — "
+            "ALPHA_VANTAGE_KEY not configured._",
+            chat_id,
+        )
+        return
+
+    today = datetime.utcnow().date()
+    within = []      # (days_until, formatted_line)
+    beyond = []      # (days_until, formatted_line)
+    unavailable = []
+
+    for ticker in portfolio.keys():
+        try:
+            cal = fetch_earnings_calendar(ticker)
+        except Exception as exc:
+            print(f"[earnings] {ticker}: lookup failed: {exc}")
+            cal = []
+        upcoming = sorted(
+            (e for e in cal if e["report_date"] >= today),
+            key=lambda x: x["report_date"],
+        )
+        if not upcoming:
+            # Either AV returned no rows, errored, or rate-limited us.
+            unavailable.append(ticker)
+            continue
+
+        nxt = upcoming[0]
+        days = (nxt["report_date"] - today).days
+        eps = _safe_float(nxt.get("estimate"))
+        eps_str = f"est ${eps:.2f}" if eps is not None else "est n/a"
+        when = (
+            "today" if days == 0
+            else "tomorrow" if days == 1
+            else f"in {days}d"
+        )
+        line = (
+            f"*{ticker}* — {nxt['report_date'].isoformat()} "
+            f"({when}), {eps_str}"
+        )
+        if days <= EARNINGS_LOOKAHEAD_DAYS:
+            within.append((days, line))
+        else:
+            beyond.append((days, line))
+
+    within.sort(key=lambda x: x[0])
+    beyond.sort(key=lambda x: x[0])
+
+    body = ["*Upcoming Earnings (next 30 days)*", ""]
+    if within:
+        body.extend(line for _, line in within)
+    else:
+        body.append("_No upcoming earnings in the next 30 days._")
+
+    if beyond:
+        body.append("")
+        body.append("*Scheduled beyond 30 days:*")
+        body.extend(line for _, line in beyond)
+
+    if unavailable:
+        body.append("")
+        body.append(
+            f"_No data (Alpha Vantage didn't return a date — possibly "
+            f"rate-limited or no scheduled earnings in 3-month horizon):_ "
+            f"{', '.join(unavailable)}"
+        )
+
+    send_telegram("\n".join(body), chat_id)
+
+
+def scheduled_earnings_check():
+    """Daily 08:00 UTC pre-market earnings sweep."""
+    chat_id = recall_chat()
+    if chat_id is None:
+        print("Skipping earnings check — no chat has interacted yet.")
+        return
+    print("[scheduled] running earnings calendar check")
+    try:
+        check_earnings_calendar(chat_id)
+    except Exception as exc:
+        print(f"[scheduled] earnings check failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Scheduled daily run at 09:00 UTC
 # ---------------------------------------------------------------------------
 def scheduled_run():
@@ -1275,6 +1619,7 @@ def scheduled_run():
     run_analysis(chat_id)
 
 
+schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 
 
