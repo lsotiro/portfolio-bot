@@ -5,6 +5,22 @@ import os
 import urllib.request
 import time
 import schedule
+from threading import Thread
+from flask import Flask
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Bot is running"
+
+
+def keep_alive():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+
+Thread(target=keep_alive, daemon=True).start()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
