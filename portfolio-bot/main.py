@@ -3,17 +3,22 @@
 Commands you can send the bot:
   /buy TICKER SHARES PRICE   add a position (e.g. /buy AAPL 10 189.50)
   /sell TICKER               remove a position from the portfolio
-  /portfolio                 show current holdings
-  /analyze                   manually trigger an analysis
+  /portfolio                 show current holdings with live P&L
+  /analyze                   run the daily HOLD/SELL review on holdings
+  /monthly                   run the monthly S&P 500 buy screen
 
-Once a day at 09:00 UTC the bot also runs the analysis automatically and
-sends the report to whichever chat last interacted with it.
+Once a day at 09:00 UTC the bot also runs /analyze automatically.
+
+Hard rules applied to every holding before Claude is consulted:
+  - Stop loss : sell if down 8% or more from entry
+  - Take profit: sell if up 20% or more from entry
 """
 
 import json
 import os
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from threading import Thread
 
@@ -22,6 +27,16 @@ import requests
 import schedule
 import yfinance as yf
 from flask import Flask
+
+# Hard trade rules (always override fundamentals)
+STOP_LOSS_PCT = -8.0
+TAKE_PROFIT_PCT = 20.0
+
+# Buy-screen filters
+SCREEN_MIN_REVENUE_GROWTH = 0.05    # > 5%
+SCREEN_MAX_RECOMMENDATION = 2.5     # analyst consensus leans buy
+SCREEN_MAX_FORWARD_PE = 40.0
+SCREEN_MIN_PROFIT_MARGIN = 0.0      # actually profitable
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -120,84 +135,154 @@ def get_sp500_tickers():
     return tickers[:100]
 
 
-def fetch_sp500_data():
-    """Fetch 5-day price data for the top 100 S&P 500 tickers."""
-    tickers = get_sp500_tickers()
-    stocks = yf.download(
-        tickers, period="5d", interval="1d", group_by="ticker", progress=False
+# Field set we care about from yfinance Ticker.info
+FUNDAMENTAL_FIELDS = (
+    "trailingPE",
+    "forwardPE",
+    "revenueGrowth",
+    "earningsGrowth",
+    "profitMargins",
+    "debtToEquity",
+    "returnOnEquity",
+    "targetMeanPrice",
+    "recommendationMean",
+)
+
+
+def get_fundamentals(ticker):
+    """Fetch a fundamentals snapshot for a single ticker via yf.Ticker.info.
+
+    Returns a dict with the fields in FUNDAMENTAL_FIELDS plus 'currentPrice'.
+    Missing values are returned as None.
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return None
+    snap = {field: info.get(field) for field in FUNDAMENTAL_FIELDS}
+    snap["ticker"] = ticker
+    snap["currentPrice"] = info.get("currentPrice") or info.get(
+        "regularMarketPrice"
     )
-    data = []
-    for ticker in tickers:
-        try:
-            t = stocks[ticker]
-            closes = t["Close"].dropna()
-            if len(closes) < 2:
-                continue
-            price = round(float(closes.iloc[-1]), 2)
-            prev = round(float(closes.iloc[-2]), 2)
-            change_pct = round(((price - prev) / prev) * 100, 2)
-            volume = int(t["Volume"].dropna().iloc[-1])
-            data.append(
-                {
-                    "ticker": ticker,
-                    "price": price,
-                    "change_pct": change_pct,
-                    "volume": volume,
-                }
-            )
-        except Exception:
-            continue
-    return data
+    return snap
+
+
+def fetch_fundamentals_bulk(tickers, max_workers=10):
+    """Fetch fundamentals for a list of tickers in parallel."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(get_fundamentals, t): t for t in tickers}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                snap = fut.result()
+            except Exception:
+                snap = None
+            if snap:
+                results[t] = snap
+    return results
+
+
+def passes_buy_screen(f):
+    """Apply the four hard fundamental filters."""
+    rg = f.get("revenueGrowth")
+    rm = f.get("recommendationMean")
+    fpe = f.get("forwardPE")
+    pm = f.get("profitMargins")
+    if rg is None or rm is None or fpe is None or pm is None:
+        return False
+    return (
+        rg > SCREEN_MIN_REVENUE_GROWTH
+        and rm < SCREEN_MAX_RECOMMENDATION
+        and fpe < SCREEN_MAX_FORWARD_PE
+        and pm > SCREEN_MIN_PROFIT_MARGIN
+    )
+
+
+def format_fund(value, suffix=""):
+    """Pretty-print a fundamental value (or 'n/a')."""
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.2f}{suffix}"
+    return f"{value}{suffix}"
+
+
+def fundamentals_line(ticker, f):
+    """One-line readable summary of a fundamentals dict."""
+    return (
+        f"{ticker}: PE(t/f)={format_fund(f.get('trailingPE'))}/"
+        f"{format_fund(f.get('forwardPE'))}, "
+        f"revGrowth={format_fund(f.get('revenueGrowth'))}, "
+        f"earnGrowth={format_fund(f.get('earningsGrowth'))}, "
+        f"margin={format_fund(f.get('profitMargins'))}, "
+        f"D/E={format_fund(f.get('debtToEquity'))}, "
+        f"ROE={format_fund(f.get('returnOnEquity'))}, "
+        f"target=${format_fund(f.get('targetMeanPrice'))}, "
+        f"rec={format_fund(f.get('recommendationMean'))}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Claude analysis
+# Claude analysis — daily portfolio review (HOLD / SELL with fundamentals)
 # ---------------------------------------------------------------------------
-def analyze_with_claude(positions, sp500_data):
-    """Ask Claude for HOLD/SELL on each position and up to 2 new BUYs."""
+def analyze_portfolio_with_claude(judged_positions):
+    """Ask Claude for HOLD/SELL on each non-hard-rule position.
+
+    `judged_positions` is a list of dicts that already had the hard
+    stop-loss / take-profit rule applied. Items with `forced_signal` set
+    are passed in as context but Claude is only asked to decide the
+    'undecided' ones.
+    """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    positions_text = "\n".join(
-        f"{p['ticker']}: {p['shares']} shares, entry ${p['entry_price']}, "
-        f"current ${p['current_price']}, P/L {p['pl_pct']}%"
-        for p in positions
-    )
+    rows = []
+    for p in judged_positions:
+        f = p["fundamentals"] or {}
+        rows.append(
+            f"{p['ticker']}: {p['shares']} shares, entry ${p['entry_price']}, "
+            f"current ${p['current_price']}, P/L {p['pl_pct']}% | "
+            f"PE(t/f)={format_fund(f.get('trailingPE'))}/"
+            f"{format_fund(f.get('forwardPE'))}, "
+            f"revGrowth={format_fund(f.get('revenueGrowth'))}, "
+            f"earnGrowth={format_fund(f.get('earningsGrowth'))}, "
+            f"margin={format_fund(f.get('profitMargins'))}, "
+            f"D/E={format_fund(f.get('debtToEquity'))}, "
+            f"ROE={format_fund(f.get('returnOnEquity'))}, "
+            f"analystTarget=${format_fund(f.get('targetMeanPrice'))}, "
+            f"rec={format_fund(f.get('recommendationMean'))}"
+        )
 
-    sp500_text = "\n".join(
-        f"{s['ticker']}: price=${s['price']}, change={s['change_pct']}%, "
-        f"volume={s['volume']}"
-        for s in sp500_data
-    )
+    portfolio_text = "\n".join(rows)
+    forced_text = "\n".join(
+        f"{p['ticker']}: {p['forced_signal']} — {p['forced_reason']}"
+        for p in judged_positions
+        if p.get("forced_signal")
+    ) or "(none)"
 
-    prompt = f"""You are a senior equity analyst reviewing a client's portfolio.
+    prompt = f"""You are a senior equity analyst doing a daily portfolio review.
 
-CURRENT PORTFOLIO:
-{positions_text}
+CURRENT POSITIONS (with live price, P/L, and fundamentals):
+{portfolio_text}
 
-S&P 500 MARKET DATA (top 100 stocks):
-{sp500_text}
+POSITIONS ALREADY MARKED SELL BY HARD RULES (do not change these):
+{forced_text}
 
-Tasks:
+For every position NOT already in the hard-rule list above, output a clear
+HOLD or SELL signal with ONE sentence of reasoning. Use BOTH price action
+AND fundamentals. Consider:
+  - revenue growth, earnings growth, profit margins, ROE trend
+  - valuation (forward PE, analyst target vs current price)
+  - leverage (debt/equity)
+  - analyst consensus (recommendationMean — lower is more bullish)
+  - momentum reversal or clearly stronger opportunities elsewhere
 
-1. For EACH position in the portfolio, give a clear HOLD or SELL signal with
-   ONE sentence of reasoning. When deciding SELL, consider:
-   - down more than 8% from entry (stop loss)
-   - up more than 25% from entry (take profit)
-   - momentum has reversed
-   - clearly better opportunities elsewhere
-
-2. Recommend AT MOST 2 new BUY opportunities from the S&P 500 list above —
-   only if there is a really strong setup. If nothing stands out, write
-   "No new buys today."
-
-Format the reply exactly like this:
+Format the reply EXACTLY like this:
 
 PORTFOLIO REVIEW:
 TICKER — HOLD or SELL — reason
-
-NEW BUY OPPORTUNITIES:
-TICKER — BUY — reason
-(or "No new buys today.")
+TICKER — HOLD or SELL — reason
+...
 
 Be direct and concise."""
 
@@ -213,7 +298,79 @@ Be direct and concise."""
 
 
 # ---------------------------------------------------------------------------
-# The main analysis routine — used by /analyze and the scheduler
+# Claude analysis — monthly buy screen
+# ---------------------------------------------------------------------------
+def pick_monthly_buys_with_claude(candidates):
+    """Ask Claude to pick the top 2 BUY opportunities from screened candidates."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    rows = []
+    for c in candidates:
+        rows.append(
+            f"{c['ticker']}: price=${format_fund(c.get('currentPrice'))}, "
+            f"PE(t/f)={format_fund(c.get('trailingPE'))}/"
+            f"{format_fund(c.get('forwardPE'))}, "
+            f"revGrowth={format_fund(c.get('revenueGrowth'))}, "
+            f"earnGrowth={format_fund(c.get('earningsGrowth'))}, "
+            f"margin={format_fund(c.get('profitMargins'))}, "
+            f"D/E={format_fund(c.get('debtToEquity'))}, "
+            f"ROE={format_fund(c.get('returnOnEquity'))}, "
+            f"analystTarget=${format_fund(c.get('targetMeanPrice'))}, "
+            f"rec={format_fund(c.get('recommendationMean'))}"
+        )
+    candidates_text = "\n".join(rows)
+
+    prompt = f"""You are a senior equity analyst running a monthly buy screen.
+
+The candidates below have ALREADY passed a hard fundamentals filter
+(revenue growth > 5%, analyst rec < 2.5, forward PE < 40, profit margin > 0).
+
+CANDIDATES:
+{candidates_text}
+
+Pick the TOP 2 BUY opportunities. For each, decide a conviction rating:
+  - STRONG → suggested position size $500
+  - MEDIUM → suggested position size $300
+
+For each pick, also produce:
+  - Target price (concrete dollar amount, not a percentage)
+  - Stop loss price (concrete dollar amount)
+  - Expected holding period in weeks
+  - Exactly 3 bullet point reasons grounded in the fundamentals shown
+
+Format your reply EXACTLY like this (no extra prose before or after):
+
+MONTHLY BUY PICKS:
+
+1) TICKER — STRONG or MEDIUM — Position: $500 or $300
+   Target: $X | Stop: $Y | Hold: N weeks
+   - reason 1
+   - reason 2
+   - reason 3
+
+2) TICKER — STRONG or MEDIUM — Position: $500 or $300
+   Target: $X | Stop: $Y | Hold: N weeks
+   - reason 1
+   - reason 2
+   - reason 3
+
+If fewer than 2 candidates are truly compelling, output only the strong
+one(s) and add a final line: "No second pick this month."
+"""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return next(
+        (block.text for block in message.content if hasattr(block, "text")),
+        "No analysis available",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daily review — used by /analyze and the scheduler
 # ---------------------------------------------------------------------------
 def run_analysis(chat_id):
     portfolio = load_portfolio()
@@ -225,39 +382,118 @@ def run_analysis(chat_id):
         return
 
     send_telegram(
-        "*Running portfolio analysis...*\nFetching prices and market data.",
+        "*Running daily portfolio review...*\n"
+        "Fetching live prices and fundamentals.",
         chat_id,
     )
 
-    # Build position rows with current price and P/L %
-    positions = []
+    tickers = list(portfolio.keys())
+    fundamentals = fetch_fundamentals_bulk(tickers)
+
+    judged_positions = []
+    forced_lines = []
     for ticker, pos in portfolio.items():
-        current = get_current_price(ticker)
+        f = fundamentals.get(ticker)
+        # Prefer the live price embedded in fundamentals; fall back otherwise.
+        current = (f or {}).get("currentPrice") or get_current_price(ticker)
         if current is None:
+            forced_lines.append(f"{ticker} — UNKNOWN — could not fetch price")
             continue
         pl_pct = round(
             ((current - pos["entry_price"]) / pos["entry_price"]) * 100, 2
         )
-        positions.append(
+
+        forced_signal = None
+        forced_reason = None
+        if pl_pct <= STOP_LOSS_PCT:
+            forced_signal = "SELL"
+            forced_reason = (
+                f"hard stop loss hit (P/L {pl_pct}% ≤ {STOP_LOSS_PCT}%)"
+            )
+        elif pl_pct >= TAKE_PROFIT_PCT:
+            forced_signal = "SELL"
+            forced_reason = (
+                f"hard take profit hit (P/L {pl_pct}% ≥ {TAKE_PROFIT_PCT}%)"
+            )
+
+        judged_positions.append(
             {
                 "ticker": ticker,
                 "shares": pos["shares"],
                 "entry_price": pos["entry_price"],
                 "current_price": current,
                 "pl_pct": pl_pct,
+                "fundamentals": f,
+                "forced_signal": forced_signal,
+                "forced_reason": forced_reason,
             }
         )
+        if forced_signal:
+            forced_lines.append(
+                f"{ticker} — {forced_signal} — {forced_reason}"
+            )
 
-    if not positions:
+    if not judged_positions:
         send_telegram(
             "Could not fetch current prices for any of your holdings.",
             chat_id,
         )
         return
 
-    sp500_data = fetch_sp500_data()
-    analysis = analyze_with_claude(positions, sp500_data)
-    send_telegram(f"*Daily Portfolio Report*\n\n{analysis}", chat_id)
+    # Ask Claude to judge the remaining (non-forced) positions
+    needs_claude = [p for p in judged_positions if not p["forced_signal"]]
+    if needs_claude:
+        claude_output = analyze_portfolio_with_claude(judged_positions)
+    else:
+        claude_output = "PORTFOLIO REVIEW:\n(all positions decided by hard rules)"
+
+    sections = ["*Daily Portfolio Report*", ""]
+    if forced_lines:
+        sections.append("*Hard-rule SELLs (override fundamentals):*")
+        sections.extend(forced_lines)
+        sections.append("")
+    sections.append(claude_output)
+    send_telegram("\n".join(sections), chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Monthly buy screen — used by /monthly
+# ---------------------------------------------------------------------------
+def run_monthly_screen(chat_id):
+    send_telegram(
+        "*Running monthly S&P 500 buy screen...*\n"
+        "Fetching fundamentals for ~100 stocks. This takes 1-2 minutes.",
+        chat_id,
+    )
+
+    tickers = get_sp500_tickers()
+    fundamentals_map = fetch_fundamentals_bulk(tickers)
+    print(
+        f"[monthly] fetched fundamentals for {len(fundamentals_map)}"
+        f" / {len(tickers)} tickers"
+    )
+
+    candidates = [
+        f for f in fundamentals_map.values() if passes_buy_screen(f)
+    ]
+    print(
+        f"[monthly] {len(candidates)} stocks pass the hard fundamental screen"
+    )
+
+    if not candidates:
+        send_telegram(
+            "No S&P 500 stocks passed the fundamental screen this month.",
+            chat_id,
+        )
+        return
+
+    picks = pick_monthly_buys_with_claude(candidates)
+    header = (
+        f"*Monthly Buy Screen*\n"
+        f"_{len(candidates)} of {len(fundamentals_map)} stocks passed "
+        f"the hard filter._\n\n"
+    )
+    send_telegram(header + picks, chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +598,10 @@ def handle_start(chat_id):
         "Commands:\n"
         "`/buy TICKER SHARES PRICE` — add a position\n"
         "`/sell TICKER` — remove a position\n"
-        "`/portfolio` — show holdings\n"
-        "`/analyze` — run analysis now",
+        "`/portfolio` — show holdings with live P&L\n"
+        "`/analyze` — daily HOLD/SELL review on holdings\n"
+        "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
+        "_Hard rules: SELL at -8% stop loss or +20% take profit._",
         chat_id,
     )
 
@@ -416,6 +654,16 @@ def poll_telegram():
                         send_telegram("Analysis started, please wait...", chat_id)
                         Thread(
                             target=run_analysis, args=(chat_id,), daemon=True
+                        ).start()
+                    elif cmd == "/monthly":
+                        send_telegram(
+                            "Monthly buy screen started, please wait...",
+                            chat_id,
+                        )
+                        Thread(
+                            target=run_monthly_screen,
+                            args=(chat_id,),
+                            daemon=True,
                         ).start()
                     else:
                         send_telegram(
