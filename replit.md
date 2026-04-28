@@ -28,14 +28,29 @@ See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and pa
 
 ## Portfolio Bot (`portfolio-bot/main.py`)
 
-Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the pnpm workspace. Holds positions in `portfolio.json`, runs daily HOLD/SELL analysis via Claude with yfinance fundamentals + NewsAPI headlines, and a Flask keep-alive on port 5000.
+Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the pnpm workspace. Holds positions in `portfolio.json`, runs the daily 100-point momentum scoring system via yfinance prices + NewsAPI headlines + Claude reasoning, and a Flask keep-alive on port 5000.
 
-### Trade rules (analyst-target based)
-- `STOP_LOSS_PCT = -7.0` — forced SELL at -7% from entry
-- `ABOVE_TARGET_FRACTION = 1.00` — forced SELL when price ≥ analyst target
-- `APPROACH_TARGET_FRACTION = 0.90` — soft alert at ≥ 90% of target
-- `LOW_TARGET_FRACTION = 0.70` — info: price ≤ 70% of target → high upside
-- Analyst targets fetched from yfinance `targetMeanPrice` on `/buy` and refreshed monthly (1st of month, before daily analysis).
+### Momentum Scoring System (primary signal engine)
+Every buy/sell signal is now driven by a **100-point momentum score** computed by `score_momentum(ticker)` (and the parallel bulk variant `score_momentum_bulk`):
+
+| Component         | Pts | Source                                   |
+|-------------------|-----|------------------------------------------|
+| Price momentum    | 30  | 1w/4w/12w returns from yfinance history (10pts each, positive)  |
+| RS vs SPY (4w)    | 20  | Stock 4w return − SPY 4w return (>3% → 20, >0% → 10) |
+| Volume confirm    | 15  | Up-day vs down-day mean volume ratio (>1.5 → 15, >0.8 → 7) |
+| News sentiment    | 20  | Keyword tally on last 24h headlines (≥70% positive → 20, ≥40% → 10, else 0) |
+| Earnings momentum | 15  | Last reported EPS beat (8) + analyst target ≥10% above current (7) |
+
+Earnings data uses `Ticker.earnings_dates` (yfinance's modern API; `quarterly_earnings` is fully deprecated). Newest-reported quarter only — future dates with NaN "Reported EPS" are filtered out before picking `iloc[0]`.
+
+Score → signal:
+- **≥80 STRONG BUY 🟢** / **≥65 BUY 🟢** / **≥50 HOLD 🟡** / **≥35 WATCH 🟡** / **<35 SELL 🔴**
+- Score `None` (insufficient history) → WATCH 🟡 (never trips a forced sell on a single bad fetch).
+
+### Trade rules (legacy rails — still used as guard rails)
+- `STOP_LOSS_PCT = -7.0` — stop-loss line shown alongside every position; the feedback-loop uses it to mark a rec STOPPED if breached intraday.
+- Analyst targets fetched from yfinance `targetMeanPrice` on `/buy` and refreshed monthly. Shown as the upside line; no longer drives a forced sell.
+- Fundamentals (`passes_buy_screen`) are used ONLY as a hard filter at the top of `/monthly` — they no longer drive any individual buy/sell signal.
 
 ### Earnings calendar (Alpha Vantage + yfinance)
 - `ALPHA_VANTAGE_KEY` secret required.
@@ -55,21 +70,16 @@ Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the
 - One-line summary embedded at top of `/portfolio`; full breakdown via `/health` and the daily 08:30 UTC push.
 - When data is missing for a component, score floors at 1.0 with an "(insufficient data)" note (matches the spec's lowest published bucket).
 
-### Deep Analysis Framework (5-pillar)
-- `get_rich_fundamentals(ticker)` — superset of basic snapshot adding valuation
-  (PEG, P/S, P/B, EV/EBITDA), quarterly growth fields, margins (gross/op/net),
-  health (D/E, current ratio, FCF, ROE, ROA), ownership %, and computed:
-  - **Analyst conviction** = `10 - ((targetHigh - targetLow) / targetMean × 10)` clamped 0-10. Tighter spread = higher conviction.
-  - **Earnings trend** — last 4 reported EPS via `get_earnings_dates(limit=12)` → 3 q/q growth rates → `accelerating` / `decelerating` / `mixed` / `insufficient`.
-- **5-pillar Claude prompt** (`FRAMEWORK_INSTRUCTIONS`): Business Quality / Growth Trajectory / Valuation / Catalyst / Risk, each scored 1-5. Total /25 → **STRONG BUY 20-25, BUY 15-19, HOLD 10-14, SELL <10**. Each pick gets concrete price target, stop loss, time horizon (weeks), bull/bear paragraphs.
-- Used by:
-  - `/monthly` — basic fetch on SP500 → hard filter → rich fetch only on the survivors → framework + top-2 pick.
-  - `/deep TICKER` — single-stock on-demand deep dive.
+### Deep Analysis (`/deep TICKER`) — momentum-based
+- Computes the full 100-point momentum score for any ticker (does not need to be in the portfolio).
+- Sends one Telegram message with the full breakdown (score, 1w/4w/12w returns, RS vs SPY, volume ratio, news, earnings beat, current price + analyst target) plus a one-sentence Claude commentary citing the strongest or weakest momentum component.
+- Logged to the rec log with `momentum_score_at_recommendation`.
+- The legacy 25-point Claude framework (`analyze_stock_deep`, `FRAMEWORK_INSTRUCTIONS`) and `get_rich_fundamentals` are still defined in `main.py` for back-compat with the historical rec log but are no longer called from any active code path.
 
 ### News Sentiment
-- `headline_sentiment(text)` — keyword regex with word boundaries; returns -1 / 0 / +1.
-- Each article carries a `sentiment` field; `aggregate_sentiment(articles)` averages to [-1, +1].
-- `format_news_block` includes per-headline POS/NEG/NEU tag and aggregate score, fed to all Claude prompts.
+- Two parallel sentiment systems:
+  - **Momentum scorer** (`_news_keyword_score`) — counts headlines matching the positive / negative word lists, returns 20 / 10 / 0 pts based on the positive-to-total ratio. Uses 1-day window for `/portfolio` and `/deep`, 7-day for `/monthly`.
+  - **Display sentiment** (`headline_sentiment`, `aggregate_sentiment`) — legacy keyword-regex per headline returning -1 / 0 / +1; still used by the older `format_news_block` helper for any legacy Claude prompts.
 
 ### Feedback Loop & Performance Tracking
 Every recommendation the bot makes is appended to `recommendations_log.json`,
@@ -81,10 +91,12 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
   the user gets the position confirmation immediately), and any SELL
   signals from the daily monitor.
 - **Schema** (`recommendations_log.json`): `id`, `date`, `ticker`,
-  `source`, `signal`, `framework_score`, `price_at_recommendation`,
-  `claude_target`, `analyst_target`, `stop_loss`, `bull_case`,
-  `bear_case`, `sp500_at_recommendation`, `status` (open/closed),
-  plus `review_4w_*` / `review_8w_*` fields populated at review time.
+  `source`, `signal`, `framework_score` (legacy, None on momentum-era recs),
+  `momentum_score_at_recommendation` (new — primary signal source),
+  `price_at_recommendation`, `claude_target`, `analyst_target`,
+  `stop_loss`, `bull_case`, `bear_case`, `sp500_at_recommendation`,
+  `status` (open/closed), plus `review_4w_*` / `review_8w_*` fields
+  populated at review time.
 - **Atomic, lock-guarded writes** — `save_recs` writes via
   temp-file + `os.replace` and `_recs_lock` brackets every read/write
   so concurrent `/buy` background threads can't corrupt the log.
@@ -114,30 +126,56 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 - 07:30 — recommendation review check (4w/8w grading)
 - 08:00 — earnings calendar sweep (and Sunday-only weekly summary)
 - 08:30 — morning portfolio health score push
-- 09:00 — unified `/portfolio` daily review (one msg per position +
-  summary). Pre-US-open briefing using analyst targets + last-known
-  prices.
+- 09:00 — unified `/portfolio` daily momentum review (one msg per
+  position + summary, plus prepended SELL/WARNING alerts). Pre-US-open
+  briefing using the 100-point momentum scoring system.
 
-### Unified `/portfolio` (daily view)
-- Replaces the old separate `/portfolio` (snapshot) and `/analyze`
-  (batched daily monitor) commands with a single command and a single
-  scheduled push at 09:00 UTC.
-- Bulk-fetches fundamentals once (one API call), then for every
-  position: applies rule-based signal+color via `_quick_judge_position`
-  (🔴 STRONG SELL stop-loss / 🔴 SELL above target / 🟡 HOLD warning
-  near stop or near target / 🟢 HOLD healthy).
-- Single batched Claude call (`_get_quick_reasons`, claude-opus-4-5,
-  JSON output, ≤600 tokens) returns one-sentence reasoning per ticker.
-  Falls back to deterministic `_fallback_reason` text if Claude is
+### Unified `/portfolio` (daily momentum view)
+- Single command + single 09:00 UTC scheduled push. Replaces the old
+  `_quick_judge_position` rule engine end-to-end with the 100-point
+  momentum system above.
+- Bulk-fetches fundamentals + 1-day news + SPY 3mo history ONCE,
+  then runs `score_momentum_bulk` (parallel, max 8 workers) so every
+  position is scored in ~5 seconds total.
+- Claude reasoning via `_get_quick_reasons` — receives the full momentum
+  breakdown (score + per-component details) and returns one sentence per
+  ticker citing the SPECIFIC strongest or weakest component. Falls back
+  to deterministic `_fallback_reason(signal, score)` if Claude is
   unavailable / errors / parses badly — never blocks the user.
-- Sends **one Telegram message per position** in 🔴 → 🟡 → 🟢 → ⚪ order
-  (color, ticker, signal / shares + entry → current / P&L + target with
-  upside or "above target" / Stop + Safe by/BELOW stop / Reason), then a
-  final 📊 PORTFOLIO SUMMARY message (total value, P&L, health score,
-  cash freed if today's SELLs are executed, action items grouped by
-  reason, strongest healthy position with upside).
-- `/buy` separately triggers its own deep analysis on the new position
-  (background thread → confirmation Telegram + feedback-loop log).
+- Sends **one Telegram message per position** in 🔴 SELL → 🟡 WATCH/HOLD
+  → 🟢 BUY/STRONG BUY order with the spec breakdown:
+  ```
+  [emoji] [TICKER] — [SIGNAL]
+  Momentum Score: XX/100
+  Price: 1W ±X% | 4W ±X% | 12W ±X%
+  vs S&P 500 (4W): Stock ±X% vs SPY ±X% → RS: ±X%
+  Volume: Buying/selling ratio X.XXx (↑ Bullish / ↓ Bearish)
+  News: X positive, X negative
+  Earnings: Beat/Missed last Q | Estimates rising/falling
+  Entry $X → Current $X | P&L: ±$X (±X%)
+  Target: $X (±X% upside) | Stop: $X
+  [Claude one-sentence reason]
+  ```
+- Final 📊 PORTFOLIO SUMMARY message bucketed by signal:
+  ```
+  🔴 SELL signals: [tickers] — momentum broken
+  🟡 WATCH signals: [tickers] — momentum weakening
+  🟢 HOLD/BUY signals: [tickers] — momentum intact
+  ```
+- **Persistence**: every position's freshly computed `momentum_score` is
+  written back to `portfolio.json`. The next scheduled run reads the
+  prior score to detect day-over-day drops > 20pts (warning trigger).
+- **Scheduled-only urgent alerts** (`scheduled=True` from `scheduled_run`):
+  - 🚨 SELL ALERT — sent immediately for any position that crossed below
+    score 35 since the last run.
+  - ⚠️ WARNING — sent for any position whose score dropped > 20 pts vs
+    yesterday (catches sudden momentum collapses BEFORE they hit the SELL
+    threshold).
+  Both alerts are sent BEFORE the regular per-position messages so they
+  surface to the top of the user's notifications.
+- `/buy` separately runs `score_momentum` in a background thread on the
+  new position, persists the initial score to `portfolio.json`, and logs
+  the rec with `momentum_score_at_recommendation`.
 
 ### Commands
 `/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`

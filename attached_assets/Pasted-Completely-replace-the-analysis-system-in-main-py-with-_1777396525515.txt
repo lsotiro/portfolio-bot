@@ -1,0 +1,198 @@
+Completely replace the analysis system in main.py with a momentum-based system. Here are the exact changes needed:
+
+1. FUNDAMENTAL FILTER ONLY (not for scoring):
+Keep fetching these from yfinance but only use them to filter out bad companies:
+- revenueGrowth > 0.10
+- profitMargins > 0
+- debtToEquity < 100
+- forwardPE < 40
+
+2. ADD this momentum scoring function:
+
+def score_momentum(ticker):
+    score = 0
+    details = {}
+    
+    try:
+        # Fetch 12 weeks price data
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="3mo")
+        spy = yf.Ticker("SPY").history(period="3mo")
+        
+        if len(hist) < 20:
+            return None, {}
+        
+        current = hist['Close'].iloc[-1]
+        week1_ago = hist['Close'].iloc[-5] if len(hist) >= 5 else hist['Close'].iloc[0]
+        week4_ago = hist['Close'].iloc[-20] if len(hist) >= 20 else hist['Close'].iloc[0]
+        week12_ago = hist['Close'].iloc[0]
+        
+        # PRICE MOMENTUM (30 points)
+        ret_1w = (current - week1_ago) / week1_ago
+        ret_4w = (current - week4_ago) / week4_ago
+        ret_12w = (current - week12_ago) / week12_ago
+        
+        if ret_1w > 0: score += 10
+        if ret_4w > 0: score += 10
+        if ret_12w > 0: score += 10
+        
+        details['ret_1w'] = round(ret_1w * 100, 1)
+        details['ret_4w'] = round(ret_4w * 100, 1)
+        details['ret_12w'] = round(ret_12w * 100, 1)
+        
+        # RELATIVE STRENGTH vs SPY (20 points)
+        spy_current = spy['Close'].iloc[-1]
+        spy_week4_ago = spy['Close'].iloc[-20] if len(spy) >= 20 else spy['Close'].iloc[0]
+        spy_ret_4w = (spy_current - spy_week4_ago) / spy_week4_ago
+        
+        rs = ret_4w - spy_ret_4w
+        if rs > 0.03: score += 20
+        elif rs > 0: score += 10
+        
+        details['rs_vs_spy'] = round(rs * 100, 1)
+        details['spy_ret_4w'] = round(spy_ret_4w * 100, 1)
+        
+        # VOLUME CONFIRMATION (15 points)
+        last_20 = hist.tail(20)
+        up_days = last_20[last_20['Close'] > last_20['Open']]
+        down_days = last_20[last_20['Close'] <= last_20['Open']]
+        
+        avg_up_vol = up_days['Volume'].mean() if len(up_days) > 0 else 0
+        avg_down_vol = down_days['Volume'].mean() if len(down_days) > 0 else 0
+        
+        if avg_down_vol > 0:
+            vol_ratio = avg_up_vol / avg_down_vol
+            if vol_ratio > 1.5: score += 15
+            elif vol_ratio > 0.8: score += 7
+            details['vol_ratio'] = round(vol_ratio, 2)
+        else:
+            score += 15
+            details['vol_ratio'] = 999
+        
+        # NEWS SENTIMENT (20 points)
+        news_score = 0
+        news_details = "No news"
+        try:
+            news_api_key = os.environ.get("NEWS_API_KEY")
+            if news_api_key:
+                url = f"https://newsapi.org/v2/everything?q={ticker}&language=en&sortBy=publishedAt&pageSize=10&apiKey={news_api_key}"
+                response = requests.get(url, timeout=5)
+                articles = response.json().get('articles', [])
+                
+                positive_words = ['beat', 'surge', 'growth', 'record', 'strong', 'upgrade', 'buy', 'bullish', 'profit', 'raised', 'exceeded', 'outperform']
+                negative_words = ['miss', 'drop', 'fall', 'weak', 'downgrade', 'sell', 'bearish', 'loss', 'cut', 'below', 'concern', 'risk', 'lawsuit']
+                
+                pos_count = 0
+                neg_count = 0
+                for article in articles:
+                    title = (article.get('title') or '').lower()
+                    desc = (article.get('description') or '').lower()
+                    text = title + ' ' + desc
+                    if any(w in text for w in positive_words): pos_count += 1
+                    if any(w in text for w in negative_words): neg_count += 1
+                
+                total = pos_count + neg_count
+                if total > 0:
+                    pos_ratio = pos_count / total
+                    if pos_ratio >= 0.7: news_score = 20
+                    elif pos_ratio >= 0.4: news_score = 10
+                    else: news_score = 0
+                else:
+                    news_score = 10
+                
+                news_details = f"{pos_count} positive, {neg_count} negative"
+        except:
+            news_score = 10
+            news_details = "Unavailable"
+        
+        score += news_score
+        details['news'] = news_details
+        
+        # EARNINGS MOMENTUM (15 points)
+        earnings_score = 0
+        try:
+            info = stock.info
+            # Beat last quarter
+            earnings_hist = stock.quarterly_earnings
+            if earnings_hist is not None and not earnings_hist.empty:
+                if 'Actual' in earnings_hist.columns and 'Estimate' in earnings_hist.columns:
+                    latest = earnings_hist.iloc[0]
+                    if latest['Actual'] > latest['Estimate']:
+                        earnings_score += 8
+                        details['earnings_beat'] = True
+                    else:
+                        details['earnings_beat'] = False
+            
+            # Estimates rising - compare current target to 30d ago approximation
+            target = info.get('targetMeanPrice', 0)
+            current_price = info.get('currentPrice', current)
+            if target > current_price * 1.10:
+                earnings_score += 7
+                details['estimates_rising'] = True
+            else:
+                details['estimates_rising'] = False
+        except:
+            earnings_score = 7
+            details['earnings_beat'] = None
+            details['estimates_rising'] = None
+        
+        score += earnings_score
+        
+    except Exception as e:
+        return None, {}
+    
+    return score, details
+
+3. ADD this function to get signal from score:
+
+def get_momentum_signal(score):
+    if score >= 80: return "STRONG BUY", "🟢"
+    elif score >= 65: return "BUY", "🟢"
+    elif score >= 50: return "HOLD", "🟡"
+    elif score >= 35: return "WATCH", "🟡"
+    else: return "SELL", "🔴"
+
+4. UPDATE /portfolio to show momentum report for each position:
+
+Format each position as:
+[EMOJI] [TICKER] — [SIGNAL]
+Momentum Score: XX/100
+Price: 1W [+X%] | 4W [+X%] | 12W [+X%]
+vs S&P 500 (4W): Stock [+X%] vs SPY [+X%] → RS: [+X%]
+Volume: Buying/selling ratio [X]x [↑ Bullish / ↓ Bearish]
+News: [X positive, X negative]
+Earnings: [Beat/Missed] last Q | Estimates [rising/falling]
+Entry $X → Current $X | P&L: [+/-]$X ([+/-]X%)
+Target: $X ([X]% upside) | Stop: $X
+[One sentence momentum reasoning from Claude]
+
+5. UPDATE /portfolio summary at end:
+📊 PORTFOLIO SUMMARY
+Total: $X | P&L: $X (X%)
+Health: X/10
+
+🔴 SELL signals: [tickers] — momentum broken
+🟡 WATCH signals: [tickers] — momentum weakening  
+🟢 HOLD/BUY signals: [tickers] — momentum intact
+
+6. UPDATE monthly screen:
+- Apply fundamental filters first
+- Score all passing stocks with score_momentum()
+- Rank by score highest to lowest
+- Pick top 2 with score >= 65
+- If none score >= 65: send message "No strong momentum opportunities this month — hold cash"
+- Show full momentum breakdown for each pick
+
+7. UPDATE /deep TICKER to show full momentum analysis
+
+8. UPDATE daily monitor at 9AM to:
+- Recalculate momentum score for each holding
+- If score drops below 35: send SELL alert immediately
+- If score drops more than 20 points vs yesterday: send WARNING alert
+- Store yesterday's score to compare (save in portfolio.json alongside position)
+
+9. UPDATE recommendations_log.json to store momentum_score_at_recommendation field
+
+10. REMOVE all 25 point fundamental framework scoring from buy/sell signals
+
+Restart after changes.

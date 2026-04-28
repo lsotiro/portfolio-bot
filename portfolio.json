@@ -5,7 +5,8 @@
     "added": "2026-04-28T14:39:58",
     "analyst_target": 268.8725,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 25
   },
   "ADSK": {
     "shares": 2.0,
@@ -13,7 +14,8 @@
     "added": "2026-04-28T14:42:22",
     "analyst_target": 325.54843,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 32
   },
   "NIO": {
     "shares": 38.0,
@@ -21,7 +23,8 @@
     "added": "2026-04-28T14:49:27",
     "analyst_target": 6.661333,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 45
   },
   "NVDA": {
     "shares": 3.0,
@@ -30,7 +33,8 @@
     "partial_alerted": true,
     "analyst_target": 268.6148,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 82
   },
   "SCHW": {
     "shares": 4.0,
@@ -38,7 +42,8 @@
     "added": "2026-04-28T15:37:16",
     "analyst_target": 115.2,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 25
   },
   "AVGO": {
     "shares": 2.0,
@@ -46,6 +51,7 @@
     "added": "2026-04-28T15:37:52",
     "analyst_target": 475.49295,
     "approach_alerted": false,
-    "above_alerted": false
+    "above_alerted": false,
+    "momentum_score": 72
   }
 }

@@ -5,32 +5,29 @@ Commands you can send the bot:
   /sell TICKER [SHARES]      sell entire position, or only N shares
   /trim TICKER               sell 50% of a position (quick partial exit)
   /portfolio                 unified daily view — every position + signal
-  /deep TICKER               full 5-pillar deep dive on any single stock
+  /deep TICKER               full momentum analysis on any single stock
   /monthly                   run the monthly S&P 500 buy screen
   /earnings                  list upcoming earnings (next 30 days)
   /health                    portfolio health score (0–10) with breakdown
 
-The 5-pillar Claude framework scores each stock on Business Quality,
-Growth Trajectory, Valuation, Catalyst, and Risk (1-5 each, total /25).
-Signals: STRONG BUY 20-25 / BUY 15-19 / HOLD 10-14 / SELL <10. News
-headlines also carry +1 / 0 / -1 sentiment via a keyword heuristic.
+Signal engine — 100-point momentum score per stock:
+  Price momentum (30) + RS vs SPY (20) + volume confirm (15)
+    + news sentiment (20) + earnings momentum (15)
+  Thresholds: ≥80 STRONG BUY / ≥65 BUY / ≥50 HOLD / ≥35 WATCH / <35 SELL
 
 Daily schedule (UTC):
   08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
   08:30 — morning portfolio health score push
-  09:00 — unified /portfolio review (one message per position)
+  09:00 — unified /portfolio momentum review. Sends an immediate SELL
+          alert for any position whose score crosses below 35, and a
+          WARNING alert for any position whose score dropped > 20 pts
+          vs yesterday (yesterday's score is persisted on each position
+          in portfolio.json).
 
-Hard rules applied to every holding before Claude is consulted:
-  - Stop loss        : forced SELL if down 7% from entry (capital protection)
-  - Above fair value : forced SELL when price ≥ analyst consensus target
-                       (strong sell signal)
-  - Approaching FV   : soft alert when price ≥ 90% of analyst target
-                       (consider selling — limited remaining upside)
-  - Big upside       : info line when price ≤ 70% of analyst target
-                       (significant remaining upside)
-Take-profit is now driven entirely by the analyst consensus target stored
-on each position — there is no flat % target. Targets are fetched when a
-position is added and refreshed on the 1st of every month.
+Fundamentals are now used ONLY as a filter for the monthly buy screen
+(rev growth > 10%, profit margin > 0, D/E < 100, fwd PE < 40 etc.) — they
+no longer drive any buy/sell signal directly. The 25-point Claude
+framework is no longer part of the signal pipeline.
 """
 
 import csv
@@ -963,87 +960,322 @@ One paragraph, grounded in the numbers above.
 
 
 # ---------------------------------------------------------------------------
-# Quick portfolio judge — used by the unified /portfolio command
+# Momentum scoring (100-point) — primary signal engine
 # ---------------------------------------------------------------------------
-def _quick_judge_position(pl_pct, current, target):
-    """Apply hard rules to derive (signal, color_emoji) for one position.
+# Five components, all derived from price/volume/news/earnings data:
+#   - Price momentum    (30 pts)  — 1w, 4w, 12w returns
+#   - RS vs SPY         (20 pts)  — 4w outperformance vs the index
+#   - Volume confirm    (15 pts)  — up-day vs down-day volume ratio
+#   - News sentiment    (20 pts)  — keyword tally on last 10 headlines
+#   - Earnings momentum (15 pts)  — last quarter beat + estimates rising
+# Score thresholds → signal (see get_momentum_signal).
+_POSITIVE_NEWS = (
+    "beat", "surge", "growth", "record", "strong", "upgrade", "buy",
+    "bullish", "profit", "raised", "exceeded", "outperform",
+)
+_NEGATIVE_NEWS = (
+    "miss", "drop", "fall", "weak", "downgrade", "sell", "bearish",
+    "loss", "cut", "below", "concern", "risk", "lawsuit",
+)
 
-    Returns:
-      signal       : "STRONG SELL" | "SELL" | "HOLD"
-      color_emoji  : "🔴" | "🟡" | "🟢"
 
-    Color rules:
-      🔴 — forced SELL (stop loss hit OR price ≥ analyst target)
-      🟡 — HOLD but in a warning zone (approaching target ≥ 90%
-           of analyst, OR within ~30% of the stop loss line)
-      🟢 — HOLD, position is healthy
+def _news_keyword_score(articles):
+    """Return (news_score:int, label:str) per the spec's keyword heuristic."""
+    if not articles:
+        return 10, "No relevant news"
+    pos = neg = 0
+    for a in articles:
+        text = (
+            ((a.get("title") or "") + " " + (a.get("description") or ""))
+            .lower()
+        )
+        if any(w in text for w in _POSITIVE_NEWS):
+            pos += 1
+        if any(w in text for w in _NEGATIVE_NEWS):
+            neg += 1
+    total = pos + neg
+    if total == 0:
+        return 10, "No relevant news"
+    ratio = pos / total
+    if ratio >= 0.7:
+        score = 20
+    elif ratio >= 0.4:
+        score = 10
+    else:
+        score = 0
+    return score, f"{pos} positive, {neg} negative"
+
+
+def score_momentum(ticker, hist=None, spy_hist=None, info=None,
+                   news_articles=None):
+    """Compute the 100-point momentum score for one ticker.
+
+    Returns ``(score:int|None, details:dict)``. Returns ``(None, {})`` on
+    a hard failure (insufficient history, etc). All upstream inputs are
+    optional — when omitted the function fetches them itself, so the
+    function is usable both stand-alone (/deep, /buy) and from a bulk
+    pre-fetched context (handle_portfolio, /monthly).
     """
-    # 🔴 — hard SELL signals first.
-    if pl_pct is not None and pl_pct <= STOP_LOSS_PCT:
-        return "STRONG SELL", "🔴"
-    if (target is not None and current is not None
-            and current >= ABOVE_TARGET_FRACTION * target):
-        return "SELL", "🔴"
+    score = 0
+    details = {}
+    try:
+        if hist is None:
+            try:
+                hist = yf.Ticker(ticker).history(period="3mo")
+            except Exception as exc:
+                print(f"[momentum {ticker}] history fetch failed: {exc}")
+                hist = None
+        if hist is None or len(hist) < 20:
+            return None, {}
 
-    # 🟡 — HOLD with a watch flag.
-    if (target is not None and current is not None
-            and current >= APPROACH_TARGET_FRACTION * target):
+        if spy_hist is None:
+            try:
+                spy_hist = yf.Ticker("SPY").history(period="3mo")
+            except Exception as exc:
+                print(f"[momentum {ticker}] SPY fetch failed: {exc}")
+                spy_hist = None
+
+        current = float(hist["Close"].iloc[-1])
+        week1_ago = float(
+            hist["Close"].iloc[-5] if len(hist) >= 5 else hist["Close"].iloc[0]
+        )
+        week4_ago = float(
+            hist["Close"].iloc[-20] if len(hist) >= 20 else hist["Close"].iloc[0]
+        )
+        week12_ago = float(hist["Close"].iloc[0])
+
+        # ── Price momentum (30 pts) ─────────────────────────────────────
+        ret_1w = (current - week1_ago) / week1_ago if week1_ago else 0
+        ret_4w = (current - week4_ago) / week4_ago if week4_ago else 0
+        ret_12w = (current - week12_ago) / week12_ago if week12_ago else 0
+        if ret_1w > 0:
+            score += 10
+        if ret_4w > 0:
+            score += 10
+        if ret_12w > 0:
+            score += 10
+        details["ret_1w"] = round(ret_1w * 100, 1)
+        details["ret_4w"] = round(ret_4w * 100, 1)
+        details["ret_12w"] = round(ret_12w * 100, 1)
+
+        # ── Relative strength vs SPY (20 pts) ───────────────────────────
+        spy_ret_4w = 0.0
+        if spy_hist is not None and not spy_hist.empty:
+            spy_current = float(spy_hist["Close"].iloc[-1])
+            spy_w4 = float(
+                spy_hist["Close"].iloc[-20] if len(spy_hist) >= 20
+                else spy_hist["Close"].iloc[0]
+            )
+            spy_ret_4w = (spy_current - spy_w4) / spy_w4 if spy_w4 else 0
+        rs = ret_4w - spy_ret_4w
+        if rs > 0.03:
+            score += 20
+        elif rs > 0:
+            score += 10
+        details["rs_vs_spy"] = round(rs * 100, 1)
+        details["spy_ret_4w"] = round(spy_ret_4w * 100, 1)
+
+        # ── Volume confirmation (15 pts) ────────────────────────────────
+        last20 = hist.tail(20)
+        up = last20[last20["Close"] > last20["Open"]]
+        down = last20[last20["Close"] <= last20["Open"]]
+        avg_up_vol = float(up["Volume"].mean()) if len(up) > 0 else 0.0
+        avg_down_vol = float(down["Volume"].mean()) if len(down) > 0 else 0.0
+        if avg_down_vol > 0:
+            vol_ratio = avg_up_vol / avg_down_vol
+            if vol_ratio > 1.5:
+                score += 15
+            elif vol_ratio > 0.8:
+                score += 7
+            details["vol_ratio"] = round(vol_ratio, 2)
+        else:
+            score += 15
+            details["vol_ratio"] = 999.0
+
+        # ── News sentiment (20 pts) ─────────────────────────────────────
+        if news_articles is None:
+            try:
+                news_articles = get_stock_news(ticker, days=1, page_size=10)
+            except Exception as exc:
+                print(f"[momentum {ticker}] news fetch failed: {exc}")
+                news_articles = []
+        news_score, news_label = _news_keyword_score(news_articles or [])
+        score += news_score
+        details["news"] = news_label
+        details["news_score"] = news_score
+
+        # ── Earnings momentum (15 pts) ──────────────────────────────────
+        # 8 pts for last-quarter beat + 7 pts for analyst-target ≥10% upside.
+        # Both wrapped individually so a single yfinance hiccup never tanks
+        # the whole component.
+        earnings_score = 0
+        details["earnings_beat"] = None
+        details["estimates_rising"] = None
+        try:
+            stock_obj = yf.Ticker(ticker)
+            # ``quarterly_earnings`` is fully deprecated in modern
+            # yfinance and always returns None. ``earnings_dates`` is the
+            # supported replacement — newest quarter first, includes
+            # estimate vs reported EPS for both PAST and UPCOMING dates.
+            # We need the most recent REPORTED quarter, so we filter out
+            # rows where Reported EPS is NaN (= future earnings dates).
+            try:
+                ed = stock_obj.earnings_dates
+                if (ed is not None and not ed.empty
+                        and "EPS Estimate" in ed.columns
+                        and "Reported EPS" in ed.columns):
+                    reported_only = ed.dropna(subset=["Reported EPS"])
+                    if not reported_only.empty:
+                        # Already sorted newest-first by yfinance.
+                        latest = reported_only.iloc[0]
+                        actual = float(latest["Reported EPS"])
+                        estimate = float(latest["EPS Estimate"])
+                        if actual > estimate:
+                            earnings_score += 8
+                            details["earnings_beat"] = True
+                        else:
+                            details["earnings_beat"] = False
+            except Exception as exc:
+                print(f"[momentum {ticker}] earnings_dates failed: {exc}")
+            target = (info or {}).get("targetMeanPrice") or 0
+            current_px = (info or {}).get("currentPrice") or current
+            if target and target > current_px * 1.10:
+                earnings_score += 7
+                details["estimates_rising"] = True
+            else:
+                details["estimates_rising"] = False
+        except Exception:
+            # If yf.Ticker itself blew up, leave earnings_score at 0 —
+            # don't artificially inflate the score on a hard failure.
+            earnings_score = 0
+        score += earnings_score
+        details["earnings_score"] = earnings_score
+
+    except Exception as exc:
+        print(f"[momentum {ticker}] hard failure: {exc}")
+        return None, {}
+
+    return score, details
+
+
+def score_momentum_bulk(tickers, fundamentals=None, news_map=None):
+    """Parallel momentum scoring for a list of tickers.
+
+    Reuses pre-fetched ``fundamentals`` (one info dict per ticker) and
+    ``news_map`` ({ticker: [articles]}) when supplied. SPY history is
+    fetched once and shared across all worker threads — saves N round-trips.
+    Returns ``{ticker: (score, details)}`` (excluding tickers that failed).
+    """
+    if not tickers:
+        return {}
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="3mo")
+    except Exception as exc:
+        print(f"[momentum-bulk] SPY history failed: {exc}")
+        spy_hist = None
+
+    out = {}
+
+    def _one(t):
+        info = (fundamentals or {}).get(t)
+        news = (news_map or {}).get(t)
+        try:
+            hist = yf.Ticker(t).history(period="3mo")
+        except Exception as exc:
+            print(f"[momentum-bulk {t}] history fetch failed: {exc}")
+            hist = None
+        return t, score_momentum(
+            t, hist=hist, spy_hist=spy_hist, info=info, news_articles=news,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for t, res in ex.map(_one, tickers):
+            if res is not None:
+                out[t] = res
+    return out
+
+
+def get_momentum_signal(score):
+    """Map a 0-100 momentum score to (signal, color_emoji).
+
+    Thresholds (per spec):
+      ≥80 STRONG BUY 🟢   ≥65 BUY 🟢   ≥50 HOLD 🟡
+      ≥35 WATCH 🟡        else SELL 🔴
+    A None score (insufficient data) renders as WATCH 🟡 — never trips a
+    forced sell on a single bad data fetch.
+    """
+    if score is None:
+        return "WATCH", "🟡"
+    if score >= 80:
+        return "STRONG BUY", "🟢"
+    if score >= 65:
+        return "BUY", "🟢"
+    if score >= 50:
         return "HOLD", "🟡"
-    # Within 30% of the stop loss line is "approaching trouble".
-    if pl_pct is not None and pl_pct <= STOP_LOSS_PCT * 0.7:
-        return "HOLD", "🟡"
-
-    # 🟢 — healthy default.
-    return "HOLD", "🟢"
+    if score >= 35:
+        return "WATCH", "🟡"
+    return "SELL", "🔴"
 
 
-def _fallback_reason(signal, color):
+def _fallback_reason(signal, score):
     """Deterministic one-liner used when Claude is unavailable."""
-    if signal == "STRONG SELL":
-        return "Stop loss breached — capital protection rule triggered."
     if signal == "SELL":
-        return "Price has reached analyst fair value, take profits."
-    if color == "🟡":
-        return "In warning zone — watch closely, consider trimming."
-    return "Position healthy, thesis intact."
+        return "Momentum broken across price, RS, and news — exit position."
+    if signal == "WATCH":
+        return "Momentum weakening — tighten stop, watch for further breakdown."
+    if signal == "HOLD":
+        return "Momentum mixed — trend intact but RS or volume is fading."
+    if signal == "BUY":
+        return "Momentum confirmed across multiple components — trend healthy."
+    if signal == "STRONG BUY":
+        return "All five momentum components firing — strongest possible setup."
+    return f"Score {score}/100 — see component breakdown above."
+
+
+def _format_momentum_for_prompt(records):
+    """Compact one-line-per-ticker momentum summary for the Claude prompt."""
+    lines = []
+    for r in records:
+        d = r.get("details") or {}
+        lines.append(
+            f"- {r['ticker']}: signal={r['signal']}, "
+            f"score={r.get('score', 'n/a')}/100, "
+            f"1w={d.get('ret_1w', 'n/a')}%, 4w={d.get('ret_4w', 'n/a')}%, "
+            f"12w={d.get('ret_12w', 'n/a')}%, "
+            f"RS={d.get('rs_vs_spy', 'n/a')}%, "
+            f"volRatio={d.get('vol_ratio', 'n/a')}, "
+            f"news={d.get('news', 'n/a')}, "
+            f"earnBeat={d.get('earnings_beat')}, "
+            f"estRising={d.get('estimates_rising')}"
+        )
+    return "\n".join(lines)
 
 
 def _get_quick_reasons(positions_data):
-    """Single batched Claude call → {ticker: one-sentence reason}.
+    """Single batched Claude call → {ticker: one-sentence momentum reason}.
 
-    `positions_data` is a list of dicts with: ticker, signal, pl_pct,
-    current, entry, target, stop. Returns a dict keyed by ticker. On
-    any failure we fall back to the rule-based reason from
-    _fallback_reason() so /portfolio always renders.
+    ``positions_data`` is a list of dicts with: ticker, signal, score,
+    details. On any failure (no API key, network, JSON parse error) we
+    fall back to the rule-based reason from _fallback_reason() so
+    /portfolio always renders.
     """
     fallback = {
-        p["ticker"]: _fallback_reason(p["signal"], p["color"])
+        p["ticker"]: _fallback_reason(p["signal"], p.get("score"))
         for p in positions_data
     }
     if not ANTHROPIC_API_KEY or not positions_data:
         return fallback
 
-    lines = []
-    for p in positions_data:
-        target_str = (
-            f"${p['target']:.2f}" if p["target"] is not None else "n/a"
-        )
-        stop_state = "OK"
-        if p["current"] is not None and p["current"] < p["stop"]:
-            stop_state = "BREACHED"
-        lines.append(
-            f"- {p['ticker']}: signal={p['signal']}, "
-            f"P/L {p['pl_pct']:+.1f}%, current ${p['current']:.2f}, "
-            f"entry ${p['entry']:.2f}, analyst target {target_str}, "
-            f"stop ${p['stop']:.2f} ({stop_state})"
-        )
     prompt = (
-        "You are a concise portfolio analyst. For each position below, "
-        "write ONE short sentence (max 14 words) explaining why the given "
-        "signal is appropriate. Be specific to the ticker — mention "
-        "valuation, momentum, fundamentals, or risk briefly. End each "
-        "sentence with a period.\n\n"
-        "Positions:\n" + "\n".join(lines) + "\n\n"
+        "You are a concise momentum-focused portfolio analyst. For each "
+        "position below you have a 100-point momentum score plus a "
+        "component breakdown (price returns, relative strength vs SPY, "
+        "volume ratio, news sentiment, earnings momentum). Write ONE "
+        "short sentence (max 16 words) per ticker explaining why the "
+        "given signal is appropriate, citing the SPECIFIC weakest or "
+        "strongest momentum component for that ticker. End each sentence "
+        "with a period.\n\n"
+        "Positions:\n" + _format_momentum_for_prompt(positions_data) + "\n\n"
         "Output STRICTLY valid JSON only (no markdown, no preamble, no "
         "trailing text). Schema:\n"
         '{"TICKER1": "reason sentence.", "TICKER2": "..."}'
@@ -1058,15 +1290,12 @@ def _get_quick_reasons(positions_data):
         text = next(
             (b.text for b in msg.content if hasattr(b, "text")), ""
         ).strip()
-        # Claude can wrap JSON in fences or add prose around it — pull out
-        # the first {...} block defensively.
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
             return fallback
         parsed = json.loads(m.group(0))
         if not isinstance(parsed, dict):
             return fallback
-        # Merge — Claude may skip a ticker; the fallback fills the gap.
         out = dict(fallback)
         for k, v in parsed.items():
             if isinstance(v, str) and v.strip():
@@ -1081,9 +1310,21 @@ def _get_quick_reasons(positions_data):
 # Monthly buy screen — used by /monthly
 # ---------------------------------------------------------------------------
 def run_monthly_screen(chat_id):
+    """Monthly buy screen — fundamental filter then momentum ranking.
+
+    Pipeline:
+      1. Pull fundamentals for the full S&P 500 (one bulk parallel fetch).
+      2. Apply the hard fundamental filters via ``passes_buy_screen`` —
+         this only rejects bad companies, it does NOT score them.
+      3. Score every survivor with ``score_momentum_bulk`` and rank.
+      4. Pick the top 2 with score ≥ 65; if none qualify, send the
+         "no strong momentum opportunities — hold cash" message.
+      5. Log each pick to the rec log with ``momentum_score_at_recommendation``.
+    The Claude 5-pillar framework call is no longer used here.
+    """
     send_telegram(
         "*Running monthly S&P 500 buy screen...*\n"
-        "Fetching fundamentals for ~100 stocks. This takes 1-2 minutes.",
+        "Fundamental filter + momentum ranking. This takes 2-4 minutes.",
         chat_id,
     )
 
@@ -1099,52 +1340,110 @@ def run_monthly_screen(chat_id):
     ]
     print(
         f"[monthly] {len(basic_candidates)} stocks pass the hard fundamental "
-        f"screen"
+        f"filter"
     )
-
     if not basic_candidates:
         send_telegram(
-            "No S&P 500 stocks passed the fundamental screen this month.",
+            "No S&P 500 stocks passed the fundamental filter this month.",
             chat_id,
         )
         return
 
-    # Per the spec, run the FULL deep framework only on stocks that passed
-    # the hard filter. Fetch rich fundamentals (analyst conviction, EPS
-    # trend, etc.) just for those candidates.
     cand_tickers = [c["ticker"] for c in basic_candidates]
-    rich_candidates_map = fetch_rich_fundamentals_bulk(cand_tickers)
-    rich_candidates = [
-        rich_candidates_map[t] for t in cand_tickers if t in rich_candidates_map
-    ]
-    print(
-        f"[monthly] fetched rich fundamentals for {len(rich_candidates)}"
-        f" / {len(cand_tickers)} candidates"
-    )
+    cand_fundamentals = {c["ticker"]: c for c in basic_candidates}
 
-    # Fetch 7-day news for each candidate so Claude can weigh recent catalysts.
+    # Pull 7-day news in bulk so the keyword-based news component of the
+    # momentum score has fresh signal without per-ticker re-fetching.
     news_map = fetch_news_bulk(cand_tickers, days=7)
     print(
         f"[monthly] fetched news for {sum(1 for v in news_map.values() if v)}"
         f" / {len(cand_tickers)} candidates"
     )
 
-    picks = pick_monthly_buys_with_claude(rich_candidates, news_map)
+    momentum_map = score_momentum_bulk(
+        cand_tickers,
+        fundamentals=cand_fundamentals,
+        news_map=news_map,
+    )
+    print(f"[monthly] scored momentum for {len(momentum_map)} candidates")
+
+    # Rank by score descending, take only those ≥ 65 (BUY threshold), top 2.
+    ranked = sorted(
+        ((t, s, d) for t, (s, d) in momentum_map.items() if s is not None),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    qualifying = [r for r in ranked if r[1] >= 65]
+    picks = qualifying[:2]
+
+    if not picks:
+        top_score = ranked[0][1] if ranked else 0
+        send_telegram(
+            f"*Monthly Buy Screen*\n"
+            f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
+            f"fundamental filter._\n\n"
+            f"No strong momentum opportunities this month — hold cash.\n"
+            f"(Best score this month: {top_score}/100, below the 65 BUY "
+            f"threshold.)",
+            chat_id,
+        )
+        return
+
     header = (
         f"*Monthly Buy Screen*\n"
-        f"_{len(basic_candidates)} of {len(fundamentals_map)} stocks passed "
-        f"the hard filter._\n\n"
+        f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
+        f"fundamental filter._\n"
+        f"_{len(qualifying)} of {len(momentum_map)} scored above 65 (BUY).  "
+        f"Top {len(picks)} below._\n"
     )
-    send_telegram(header + picks, chat_id)
+    send_telegram(header, chat_id)
+
+    # One Telegram message per pick with the full momentum breakdown.
+    parsed_for_log = []
+    for t, score, d in picks:
+        signal, color = get_momentum_signal(score)
+        f = cand_fundamentals.get(t, {}) or {}
+        current_px = f.get("currentPrice")
+        target = _safe_target(f.get("targetMeanPrice"))
+        current_line = (
+            f"Current price: ${current_px:.2f}" if current_px else "Current price: n/a"
+        )
+        target_line = (
+            f"Analyst target: ${target:.2f}" if target else "Analyst target: n/a"
+        )
+        send_telegram(
+            f"{color} {t} — {signal}\n"
+            f"Momentum Score: {score}/100\n"
+            f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+            f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
+            f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
+            f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
+            f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
+            f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
+            f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+            f"News: {d.get('news', 'n/a')}\n"
+            f"Earnings: "
+            f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
+            f"{current_line} | {target_line}",
+            chat_id,
+            parse_mode=None,
+        )
+        parsed_for_log.append({
+            "ticker": t,
+            "signal": signal,
+            "claude_target": None,
+            "stop_loss": None,
+            "bull_case": None,
+            "bear_case": None,
+        })
 
     # Feedback loop — log every monthly pick so we can grade it later.
     try:
-        rich_by_ticker = {c["ticker"]: c for c in rich_candidates}
-        parsed_picks = parse_monthly_picks(picks)
         log_recommendations(
-            parsed_picks,
-            price_lookup=lambda t: (rich_by_ticker.get(t, {}) or {}).get("currentPrice"),
-            analyst_lookup=lambda t: _safe_target((rich_by_ticker.get(t, {}) or {}).get("targetMeanPrice")),
+            parsed_for_log,
+            price_lookup=lambda t: (cand_fundamentals.get(t, {}) or {}).get("currentPrice"),
+            analyst_lookup=lambda t: _safe_target((cand_fundamentals.get(t, {}) or {}).get("targetMeanPrice")),
+            momentum_lookup=lambda t: momentum_map.get(t, (None, None))[0],
             source="monthly",
         )
     except Exception as exc:
@@ -1338,8 +1637,15 @@ def parse_framework_blocks(text):
     return out
 
 
-def _make_rec(ticker, parsed, price, analyst_target, source):
-    """Construct one recommendation dict from a parsed framework block."""
+def _make_rec(ticker, parsed, price, analyst_target, source,
+              momentum_score=None):
+    """Construct one recommendation dict.
+
+    ``parsed`` is a flexible dict — for momentum-era recs it contains
+    {signal, claude_target, stop_loss, bull_case, bear_case}. The legacy
+    ``framework_score`` field is preserved for back-compat with old log
+    entries but is no longer set by current code paths.
+    """
     today = _today_iso()
     return {
         "id": f"{today}-{ticker}-{int(time.time())}",
@@ -1347,7 +1653,10 @@ def _make_rec(ticker, parsed, price, analyst_target, source):
         "ticker": ticker,
         "source": source,
         "signal": parsed.get("signal"),
+        # Kept None on new recs — no longer used as a buy/sell signal.
         "framework_score": parsed.get("total_score"),
+        # NEW: primary signal source for the momentum-era system.
+        "momentum_score_at_recommendation": momentum_score,
         "price_at_recommendation": price,
         "claude_target": parsed.get("claude_target"),
         "analyst_target": analyst_target,
@@ -1366,12 +1675,14 @@ def _make_rec(ticker, parsed, price, analyst_target, source):
 
 
 def log_recommendations(parsed_blocks, price_lookup, analyst_lookup, source,
-                        signals_to_log=None):
-    """Append framework blocks to the rec log, optionally filtered by signal.
+                        signals_to_log=None, momentum_lookup=None):
+    """Append rec blocks to the log, optionally filtered by signal.
 
-    `price_lookup(ticker)` returns the price-at-recommendation.
-    `analyst_lookup(ticker)` returns the analyst target (or None).
-    `signals_to_log` is a set like {"STRONG BUY", "BUY"}; None = log all.
+    ``price_lookup(ticker)`` → price at recommendation.
+    ``analyst_lookup(ticker)`` → analyst target (or None).
+    ``momentum_lookup(ticker)`` → momentum score at recommendation
+        (None when the rec source predates the momentum system).
+    ``signals_to_log`` is a set like {"STRONG BUY", "BUY"}; None = log all.
     """
     if not parsed_blocks:
         return 0
@@ -1383,9 +1694,13 @@ def log_recommendations(parsed_blocks, price_lookup, analyst_lookup, source,
             if signals_to_log is not None and sig not in signals_to_log:
                 continue
             t = p["ticker"]
+            momentum = (
+                momentum_lookup(t) if momentum_lookup is not None else None
+            )
             try:
                 rec = _make_rec(
                     t, p, price_lookup(t), analyst_lookup(t), source,
+                    momentum_score=momentum,
                 )
             except Exception as exc:
                 print(f"[recs] failed to build rec for {t}: {exc}")
@@ -1806,33 +2121,58 @@ def handle_buy(args, chat_id):
             chat_id,
         )
 
-    # Feedback loop — kick off a deep analysis on the new position so the
-    # /buy decision gets logged like any other recommendation. Runs in the
-    # background so the user gets the confirmation immediately.
-    def _buy_deep_log():
+    # Feedback loop — kick off a momentum analysis on the new position so
+    # the /buy decision gets logged like any other recommendation. Runs in
+    # the background so the user gets the confirmation immediately. The
+    # 25-point fundamental framework is no longer used here.
+    def _buy_momentum_log():
         try:
-            rich = get_rich_fundamentals(ticker)
-            if not rich:
+            try:
+                info = yf.Ticker(ticker).info
+            except Exception:
+                info = fund
+            news = get_stock_news(ticker, days=1, page_size=10)
+            score, details = score_momentum(
+                ticker, info=info, news_articles=news,
+            )
+            if score is None:
+                print(f"[/buy {ticker}] could not compute momentum — skip log")
                 return
-            news = get_stock_news(ticker, days=7, page_size=5)
-            position = load_portfolio().get(ticker)
-            result = analyze_stock_deep(ticker, rich, position, news)
+            signal, _ = get_momentum_signal(score)
+
+            # Persist the just-computed score on the new position so the
+            # daily monitor's "drop > 20pts" comparison has a baseline.
+            # Race-window vs a concurrent /sell is acceptable here — the
+            # next /portfolio run rewrites the score anyway.
+            pf = load_portfolio()
+            if ticker in pf:
+                pf[ticker]["momentum_score"] = score
+                save_portfolio(pf)
+
             send_telegram(
-                f"*Deep analysis logged for {ticker}:*\n\n{result}",
+                f"Momentum logged for *{ticker}*: {score}/100 → {signal}",
                 chat_id,
             )
-            parsed = parse_framework_blocks(result)
+            parsed = [{
+                "ticker": ticker,
+                "signal": signal,
+                "claude_target": None,
+                "stop_loss": None,
+                "bull_case": None,
+                "bear_case": None,
+            }]
             log_recommendations(
                 parsed,
                 # Use the user's actual fill price as the rec baseline.
                 price_lookup=lambda _t: price,
                 analyst_lookup=lambda _t: target,
+                momentum_lookup=lambda _t: score,
                 source="buy",
             )
         except Exception as exc:
-            print(f"[/buy {ticker}] deep-log failed: {exc}")
+            print(f"[/buy {ticker}] momentum-log failed: {exc}")
 
-    Thread(target=_buy_deep_log, daemon=True).start()
+    Thread(target=_buy_momentum_log, daemon=True).start()
 
 
 def handle_sell(args, chat_id):
@@ -1948,10 +2288,47 @@ def handle_trim(args, chat_id):
         )
 
 
-def handle_portfolio(chat_id):
-    """Unified daily view — one Telegram message per position (🔴 → 🟡 → 🟢
-    order) followed by a single summary message. Replaces the old separate
-    /portfolio + /analyze split."""
+def _fmt_signed_pct(value):
+    """`+5.2%` / `-3.1%` / `n/a` — handles None for missing momentum data."""
+    return "n/a" if value is None else f"{value:+.1f}%"
+
+
+def _vol_label(vol_ratio):
+    """Render the volume ratio with a directional bullish/bearish flag."""
+    if vol_ratio is None:
+        return "n/a"
+    if vol_ratio >= 999:
+        return "all-up days (no down days, ↑ Bullish)"
+    arrow = "↑ Bullish" if vol_ratio >= 1.0 else "↓ Bearish"
+    return f"{vol_ratio:.2f}x ({arrow})"
+
+
+def _earnings_label(beat, est_rising):
+    """Render the earnings momentum line text."""
+    beat_txt = (
+        "Beat" if beat is True else "Missed" if beat is False else "n/a"
+    )
+    est_txt = (
+        "rising" if est_rising is True
+        else "falling" if est_rising is False
+        else "n/a"
+    )
+    return f"{beat_txt} last Q | Estimates {est_txt}"
+
+
+def handle_portfolio(chat_id, scheduled=False):
+    """Unified daily view — one Telegram message per position with full
+    momentum breakdown (🔴 SELL → 🟡 WATCH/HOLD → 🟢 BUY/STRONG BUY order)
+    followed by a single summary message bucketed by signal.
+
+    When ``scheduled=True`` (called from the 09:00 UTC cron) extra alerts
+    are sent BEFORE the main report:
+      - immediate SELL alert for any position whose score dropped below 35
+      - WARNING alert for any position whose score fell more than 20 points
+        vs yesterday
+    Yesterday's score is read from ``portfolio[ticker]['momentum_score']``
+    and the new score is written back at the end of every run.
+    """
     portfolio = load_portfolio()
     if not portfolio:
         send_telegram(
@@ -1960,16 +2337,26 @@ def handle_portfolio(chat_id):
         )
         return
 
-    # Stop loss is negative (e.g. -7) — convert to a price multiplier.
     stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)  # e.g. 0.93
 
-    # Bulk-fetch fundamentals once. Lazily backfill any missing analyst
-    # target on existing positions while we're at it.
     tickers = list(portfolio.keys())
     fundamentals = fetch_fundamentals_bulk(tickers)
     portfolio_dirty = False
 
-    # ── Build per-position record (everything needed to render + sort) ──
+    # Pull 1-day news once for every holding so the momentum scorer can
+    # share the result rather than each thread hitting NewsAPI separately.
+    try:
+        news_map = fetch_news_bulk(tickers, days=1)
+    except Exception as exc:
+        print(f"[/portfolio] bulk news fetch failed: {exc}")
+        news_map = {}
+
+    # The heavy lifting — momentum scores for every holding in parallel.
+    momentum_map = score_momentum_bulk(
+        tickers, fundamentals=fundamentals, news_map=news_map,
+    )
+
+    # ── Build per-position record ───────────────────────────────────────
     records = []
     for ticker, pos in portfolio.items():
         shares = pos["shares"]
@@ -1987,48 +2374,89 @@ def handle_portfolio(chat_id):
 
         stop_price = entry * stop_factor
 
+        prev_score = pos.get("momentum_score")  # may be None
+        score_details = momentum_map.get(ticker)
+        score = score_details[0] if score_details else None
+        details = score_details[1] if score_details else {}
+        signal, color = get_momentum_signal(score)
+
+        # Persist the freshly-computed score so tomorrow's scheduled run
+        # can compare against today's value.
+        if score is not None and pos.get("momentum_score") != score:
+            pos["momentum_score"] = score
+            portfolio_dirty = True
+
         if current is None:
             records.append({
                 "ticker": ticker, "shares": shares, "entry": entry,
                 "current": None, "target": target, "stop": stop_price,
                 "pl_dollar": None, "pl_pct": None,
-                "signal": "HOLD", "color": "⚪",
-                "reason": "Price unavailable — could not fetch quote.",
+                "signal": signal, "color": color,
+                "score": score, "prev_score": prev_score,
+                "details": details, "reason": None,
             })
             continue
 
         pl_dollar = (current - entry) * shares
         pl_pct = ((current - entry) / entry) * 100
-        signal, color = _quick_judge_position(pl_pct, current, target)
         records.append({
             "ticker": ticker, "shares": shares, "entry": entry,
             "current": current, "target": target, "stop": stop_price,
             "pl_dollar": pl_dollar, "pl_pct": pl_pct,
-            "signal": signal, "color": color, "reason": None,
+            "signal": signal, "color": color,
+            "score": score, "prev_score": prev_score,
+            "details": details, "reason": None,
         })
 
     if portfolio_dirty:
         save_portfolio(portfolio)
 
-    # ── Single batched Claude call → one-sentence reason per position ──
-    judged = [r for r in records if r["current"] is not None]
+    # ── Single batched Claude call → one-sentence momentum reason ──────
+    judged = [r for r in records if r["score"] is not None]
     reasons = _get_quick_reasons(judged)
     for r in records:
-        if r["reason"] is None:
-            r["reason"] = reasons.get(
-                r["ticker"], _fallback_reason(r["signal"], r["color"])
-            )
+        r["reason"] = reasons.get(
+            r["ticker"], _fallback_reason(r["signal"], r.get("score"))
+        )
 
-    # ── Sort: 🔴 first, 🟡 second, 🟢 last, ⚪ (price-unavailable) at end ──
-    color_order = {"🔴": 0, "🟡": 1, "🟢": 2, "⚪": 3}
+    # ── Scheduled-only urgent alerts (sent BEFORE the main report) ─────
+    if scheduled:
+        for r in records:
+            if r["score"] is not None and r["score"] < 35:
+                send_telegram(
+                    f"🚨 SELL ALERT — {r['ticker']}\n"
+                    f"Momentum score collapsed to {r['score']}/100 "
+                    f"(SELL threshold).\n"
+                    f"Reason: {r['reason']}",
+                    chat_id,
+                    parse_mode=None,
+                )
+            if (r["score"] is not None and r["prev_score"] is not None
+                    and (r["prev_score"] - r["score"]) > 20):
+                send_telegram(
+                    f"⚠️ WARNING — {r['ticker']}\n"
+                    f"Momentum dropped {r['prev_score']} → {r['score']} "
+                    f"({r['prev_score'] - r['score']} pts) since yesterday.\n"
+                    f"Reason: {r['reason']}",
+                    chat_id,
+                    parse_mode=None,
+                )
+
+    # ── Sort: 🔴 first, 🟡 second, 🟢 last ────────────────────────────
+    color_order = {"🔴": 0, "🟡": 1, "🟢": 2}
     records.sort(key=lambda r: (color_order.get(r["color"], 9), r["ticker"]))
 
-    # ── Send ONE Telegram message per position in the sorted order ──
+    # ── Send ONE Telegram message per position with full momentum block ─
     for r in records:
+        d = r.get("details") or {}
+        score_str = f"{r['score']}/100" if r["score"] is not None else "n/a"
+
         if r["current"] is None:
             send_telegram(
-                f"{r['color']} {r['ticker']} — price unavailable\n"
-                f"{r['shares']} shares | Entry ${r['entry']:.2f}\n"
+                f"{r['color']} {r['ticker']} — {r['signal']}\n"
+                f"Momentum Score: {score_str}\n"
+                f"{r['shares']} shares | Entry ${r['entry']:.2f} | "
+                f"Current: price unavailable\n"
                 f"Reason: {r['reason']}",
                 chat_id,
                 parse_mode=None,
@@ -2037,44 +2465,42 @@ def handle_portfolio(chat_id):
 
         pl_sign = "+" if r["pl_dollar"] >= 0 else "-"
         pl_line = (
+            f"Entry ${r['entry']:.2f} → Current ${r['current']:.2f} | "
             f"P&L: {pl_sign}${abs(r['pl_dollar']):.2f} "
             f"({r['pl_pct']:+.1f}%)"
         )
 
         if r["target"] is not None:
-            # Single literal template per spec: "(X% upside)". When
-            # current price is above the analyst target, X comes out
-            # negative — the explicit sign keeps the meaning unambiguous.
             upside_pct = ((r["target"] - r["current"]) / r["current"]) * 100
             target_str = (
-                f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside)"
+                f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside) | "
+                f"Stop: ${r['stop']:.2f}"
             )
         else:
-            target_str = "Target: n/a"
+            target_str = f"Target: n/a | Stop: ${r['stop']:.2f}"
 
-        dist_to_stop = r["current"] - r["stop"]
-        if dist_to_stop >= 0:
-            stop_line = (
-                f"Stop: ${r['stop']:.2f} | Safe by ${dist_to_stop:.2f}"
-            )
-        else:
-            stop_line = (
-                f"Stop: ${r['stop']:.2f} | "
-                f"BELOW stop by ${abs(dist_to_stop):.2f}"
-            )
-
+        # Spec format: full momentum breakdown then position math then reason.
         send_telegram(
             f"{r['color']} {r['ticker']} — {r['signal']}\n"
-            f"{r['shares']} shares | Entry ${r['entry']:.2f} → "
-            f"Current ${r['current']:.2f}\n"
-            f"{pl_line} | {target_str}\n"
-            f"{stop_line}\n"
-            f"Reason: {r['reason']}",
+            f"Momentum Score: {score_str}\n"
+            f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+            f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
+            f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
+            f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
+            f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
+            f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
+            f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+            f"News: {d.get('news', 'n/a')}\n"
+            f"Earnings: "
+            f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
+            f"{pl_line}\n"
+            f"{target_str}\n"
+            f"{r['reason']}",
             chat_id,
             parse_mode=None,
         )
 
-    # ── Final summary message ───────────────────────────────────────────
+    # ── Final summary message — bucketed by signal per spec ────────────
     priced = [r for r in records if r["current"] is not None]
     total_cost = sum(r["entry"] * r["shares"] for r in priced)
     total_value = sum(r["current"] * r["shares"] for r in priced)
@@ -2082,82 +2508,54 @@ def handle_portfolio(chat_id):
     total_pct = (total_pl / total_cost * 100) if total_cost > 0 else 0
     pl_sign = "+" if total_pl >= 0 else "-"
 
-    # Health score — reuse the bulk fundamentals so zero extra API calls.
     health_line = ""
     try:
         health = calculate_health_score(portfolio, fundamentals)
         if health is not None:
             health_line = (
-                f"Health score: {health['score']}/10 "
-                f"{health['rating_emoji']}\n"
+                f"Health: {health['score']}/10 {health['rating_emoji']}"
             )
     except Exception as exc:
         print(f"[health] portfolio summary failed: {exc}")
 
-    # "Cash available to deploy" — derived from forced SELLs (the bot
-    # doesn't track a cash balance separately). If you execute today's
-    # SELLs, you free up this much capital.
-    sell_records = [r for r in priced if r["color"] == "🔴"]
-    freed_cash = sum(r["current"] * r["shares"] for r in sell_records)
-
-    # Reason tag for each red position.
-    red_with_reason = []
-    for r in sell_records:
-        if r["signal"] == "STRONG SELL":
-            tag = "below stop loss"
-        elif r["signal"] == "SELL":
-            tag = "above target"
-        else:
-            tag = "needs review"
-        red_with_reason.append((r["ticker"], tag))
-
-    if red_with_reason:
-        # Group by reason for a cleaner string e.g.  "CRM, ADSK (below stop loss)"
-        by_tag = {}
-        for t, tag in red_with_reason:
-            by_tag.setdefault(tag, []).append(t)
-        action_parts = [
-            f"{', '.join(ts)} ({tag})" for tag, ts in by_tag.items()
-        ]
-        action_line = "Positions needing action: " + "; ".join(action_parts)
-    else:
-        action_line = "Positions needing action: none — all clear."
-
-    # Strongest position — highest P&L % among healthy holdings (🟢).
-    healthy = [r for r in priced if r["color"] == "🟢"]
-    if healthy:
-        top = max(healthy, key=lambda r: r["pl_pct"])
-        if top["target"] is not None:
-            top_upside = (
-                ((top["target"] - top["current"]) / top["current"]) * 100
-            )
-            strongest_line = (
-                f"Strongest position: {top['ticker']} "
-                f"({top['pl_pct']:+.1f}%, {top_upside:.0f}% upside)"
-            )
-        else:
-            strongest_line = (
-                f"Strongest position: {top['ticker']} ({top['pl_pct']:+.1f}%)"
-            )
-    else:
-        strongest_line = "Strongest position: n/a (no green positions)"
+    # Three signal buckets per spec.
+    sell_tickers = [r["ticker"] for r in records if r["signal"] == "SELL"]
+    watch_tickers = [
+        r["ticker"] for r in records if r["signal"] == "WATCH"
+    ]
+    hold_buy_tickers = [
+        r["ticker"] for r in records
+        if r["signal"] in ("HOLD", "BUY", "STRONG BUY")
+    ]
 
     summary_lines = [
         "📊 PORTFOLIO SUMMARY",
-        f"Total value: ${total_value:,.0f} | "
+        f"Total: ${total_value:,.0f} | "
         f"P&L: {pl_sign}${abs(total_pl):,.0f} ({total_pct:+.1f}%)",
     ]
     if health_line:
-        summary_lines.append(health_line.rstrip())
-    summary_lines.append(f"Cash available to deploy: ${freed_cash:,.0f}")
+        summary_lines.append(health_line)
     summary_lines.append("")
-    summary_lines.append(action_line)
-    summary_lines.append(strongest_line)
+    summary_lines.append(
+        "🔴 SELL signals: "
+        + (", ".join(sell_tickers) if sell_tickers else "none")
+        + " — momentum broken"
+    )
+    summary_lines.append(
+        "🟡 WATCH signals: "
+        + (", ".join(watch_tickers) if watch_tickers else "none")
+        + " — momentum weakening"
+    )
+    summary_lines.append(
+        "🟢 HOLD/BUY signals: "
+        + (", ".join(hold_buy_tickers) if hold_buy_tickers else "none")
+        + " — momentum intact"
+    )
     send_telegram("\n".join(summary_lines), chat_id, parse_mode=None)
 
 
 def handle_deep(args, chat_id):
-    """`/deep TICKER` — run the full 5-pillar framework on any stock."""
+    """`/deep TICKER` — full momentum analysis on any stock."""
     if not args:
         send_telegram(
             "Usage: /deep TICKER\nExample: /deep NVDA",
@@ -2166,38 +2564,89 @@ def handle_deep(args, chat_id):
         return
     ticker = args[0].upper()
     send_telegram(
-        f"*Running deep analysis on {ticker}...*\n"
-        "Pulling rich fundamentals, earnings trend & news. ~20s.",
+        f"*Running momentum analysis on {ticker}...*\n"
+        "Pulling 12-week price history, news & earnings. ~10s.",
         chat_id,
     )
 
     def _run():
         try:
-            rich = get_rich_fundamentals(ticker)
-            if not rich or not rich.get("currentPrice"):
+            # Fetch the inputs we'll share with the scorer once each.
+            try:
+                info = yf.Ticker(ticker).info
+            except Exception:
+                info = None
+            news = get_stock_news(ticker, days=1, page_size=10)
+
+            score, details = score_momentum(
+                ticker, info=info, news_articles=news,
+            )
+            if score is None:
                 send_telegram(
-                    f"Could not fetch fundamentals for *{ticker}*. "
-                    f"Check the ticker spelling.",
+                    f"Could not compute momentum for *{ticker}* — "
+                    f"insufficient price history. Check the ticker spelling.",
                     chat_id,
                 )
                 return
-            portfolio = load_portfolio()
-            position = portfolio.get(ticker)
-            news = get_stock_news(ticker, days=7, page_size=5)
-            result = analyze_stock_deep(ticker, rich, position, news)
-            news_summary = (
-                f"News sentiment: {sentiment_label(aggregate_sentiment(news))} "
-                f"({len(news)} headlines, last 7d)"
-                if news else "News: (no headlines available)"
+
+            signal, color = get_momentum_signal(score)
+            current_px = (info or {}).get("currentPrice")
+            target = _safe_target((info or {}).get("targetMeanPrice"))
+
+            # Reuse the same Claude reasoning helper used by /portfolio so
+            # the wording stays consistent across commands.
+            reasons = _get_quick_reasons([{
+                "ticker": ticker, "signal": signal, "color": color,
+                "score": score, "details": details,
+            }])
+            reason = reasons.get(
+                ticker, _fallback_reason(signal, score)
             )
-            send_telegram(f"{result}\n\n_{news_summary}_", chat_id)
-            # Feedback loop — log this on-demand recommendation.
+
+            d = details
+            target_line = (
+                f"Analyst target: ${target:.2f}" if target else "Analyst target: n/a"
+            )
+            current_line = (
+                f"Current price: ${current_px:.2f}" if current_px else "Current price: n/a"
+            )
+
+            send_telegram(
+                f"{color} {ticker} — {signal}\n"
+                f"Momentum Score: {score}/100\n"
+                f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+                f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
+                f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
+                f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
+                f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
+                f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
+                f"Volume: Buying/selling ratio {_vol_label(d.get('vol_ratio'))}\n"
+                f"News: {d.get('news', 'n/a')}\n"
+                f"Earnings: "
+                f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
+                f"{current_line} | {target_line}\n"
+                f"{reason}",
+                chat_id,
+                parse_mode=None,
+            )
+
+            # Feedback loop — log this on-demand recommendation with the
+            # momentum score (no claude_target / stop_loss available from
+            # the momentum-only flow).
             try:
-                parsed = parse_framework_blocks(result)
+                parsed = [{
+                    "ticker": ticker,
+                    "signal": signal,
+                    "claude_target": None,
+                    "stop_loss": None,
+                    "bull_case": None,
+                    "bear_case": None,
+                }]
                 log_recommendations(
                     parsed,
-                    price_lookup=lambda _t: rich.get("currentPrice"),
-                    analyst_lookup=lambda _t: _safe_target(rich.get("targetMeanPrice")),
+                    price_lookup=lambda _t: current_px,
+                    analyst_lookup=lambda _t: target,
+                    momentum_lookup=lambda _t: score,
                     source="deep",
                 )
             except Exception as exc:
@@ -2205,7 +2654,7 @@ def handle_deep(args, chat_id):
         except Exception as exc:
             print(f"[/deep {ticker}] error: {exc}")
             send_telegram(
-                f"Deep analysis for *{ticker}* failed: {exc}",
+                f"Momentum analysis for *{ticker}* failed: {exc}",
                 chat_id,
             )
 
@@ -2219,10 +2668,10 @@ def handle_start(chat_id):
         "`/buy TICKER SHARES PRICE` — add a position\n"
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
-        "`/portfolio` — unified daily view (one msg per position + summary)\n"
+        "`/portfolio` — momentum-scored daily view (one msg per position + summary)\n"
         "`/health` — portfolio health score (0–10) with breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
-        "`/deep TICKER` — full 5-pillar deep dive on any stock\n"
+        "`/deep TICKER` — full momentum analysis on any stock\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
         "`/performance` — track record vs S&P 500\n\n"
@@ -2955,10 +3404,11 @@ def scheduled_run():
     if chat_id is None:
         print("Skipping scheduled run — no chat has interacted with the bot yet.")
         return
-    # Same unified daily view as /portfolio — one message per position in
-    # 🔴 → 🟡 → 🟢 order, then a summary message. Analyst targets are
-    # refreshed inline so the old monthly bulk refresh is no longer needed.
-    handle_portfolio(chat_id)
+    # Same unified momentum view as /portfolio — one message per position
+    # in 🔴 SELL → 🟡 WATCH/HOLD → 🟢 BUY/STRONG BUY order then a summary.
+    # ``scheduled=True`` enables the per-position SELL-on-<35 alerts and
+    # WARNING alerts when the score dropped >20 pts vs yesterday.
+    handle_portfolio(chat_id, scheduled=True)
 
 
 schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
