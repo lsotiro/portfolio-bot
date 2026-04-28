@@ -4,8 +4,7 @@ Commands you can send the bot:
   /buy TICKER SHARES PRICE   add a position (e.g. /buy AAPL 10 189.50)
   /sell TICKER [SHARES]      sell entire position, or only N shares
   /trim TICKER               sell 50% of a position (quick partial exit)
-  /portfolio                 show current holdings with live P&L
-  /analyze                   run the daily 5-pillar review on holdings
+  /portfolio                 unified daily view — every position + signal
   /deep TICKER               full 5-pillar deep dive on any single stock
   /monthly                   run the monthly S&P 500 buy screen
   /earnings                  list upcoming earnings (next 30 days)
@@ -19,7 +18,7 @@ headlines also carry +1 / 0 / -1 sentiment via a keyword heuristic.
 Daily schedule (UTC):
   08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
   08:30 — morning portfolio health score push
-  09:00 — full /analyze portfolio review
+  09:00 — unified /portfolio review (one message per position)
 
 Hard rules applied to every holding before Claude is consulted:
   - Stop loss        : forced SELL if down 7% from entry (capital protection)
@@ -188,14 +187,16 @@ def recall_chat():
 # ---------------------------------------------------------------------------
 # Telegram messaging
 # ---------------------------------------------------------------------------
-def send_telegram(message, chat_id):
-    """Send a Markdown message to a Telegram chat."""
+def send_telegram(message, chat_id, parse_mode="Markdown"):
+    """Send a message to a Telegram chat. Pass parse_mode=None for plain
+    text — the unified /portfolio per-position messages do this so that
+    Claude-generated reason text containing `_`, `*`, `[` etc. cannot
+    cause Telegram to silently reject the message (`ok: false`)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
-        timeout=30,
-    )
+    payload = {"chat_id": chat_id, "text": message}
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    requests.post(url, json=payload, timeout=30)
 
 
 # ---------------------------------------------------------------------------
@@ -962,380 +963,118 @@ One paragraph, grounded in the numbers above.
 
 
 # ---------------------------------------------------------------------------
-# Daily review — used by /analyze and the scheduler
+# Quick portfolio judge — used by the unified /portfolio command
 # ---------------------------------------------------------------------------
-def _trigger_deep_for_mover(ticker, move_pct, position, chat_id):
-    """Background helper — runs full deep analysis for a >3% single-day mover."""
-    try:
-        rich = get_rich_fundamentals(ticker)
-        if not rich:
-            return
-        news = get_stock_news(ticker, days=7, page_size=5)
-        result = analyze_stock_deep(ticker, rich, position, news)
-        send_telegram(
-            f"📈 *{ticker}* moved {move_pct:+.1f}% today — auto deep analysis:\n\n"
-            f"{result}",
-            chat_id,
-        )
-        # Log to feedback loop so big-mover deep-dives count toward track record.
-        try:
-            parsed = parse_framework_blocks(result)
-            log_recommendations(
-                parsed,
-                price_lookup=lambda _t: rich.get("currentPrice"),
-                analyst_lookup=lambda _t: _safe_target(rich.get("targetMeanPrice")),
-                source="daily-mover",
-            )
-        except Exception as exc:
-            print(f"[recs] mover deep-log failed for {ticker}: {exc}")
-    except Exception as exc:
-        print(f"[mover {ticker}] deep analysis failed: {exc}")
+def _quick_judge_position(pl_pct, current, target):
+    """Apply hard rules to derive (signal, color_emoji) for one position.
 
+    Returns:
+      signal       : "STRONG SELL" | "SELL" | "HOLD"
+      color_emoji  : "🔴" | "🟡" | "🟢"
 
-def run_analysis(chat_id):
-    """Lightweight daily monitor.
-
-    Workflow:
-      1. Bulk-fetch fundamentals (refreshes analyst target for every holding).
-      2. For each position: refresh target (alerting on changes for big movers),
-         compute today's % move from previousClose, and apply hard SELL rules.
-      3. Send a one-line-per-position summary (no Claude framework call).
-      4. Spawn background deep analyses for any position moving > 3% today.
-      5. Send target-change alerts for any position moving > 5% today whose
-         analyst consensus also shifted significantly.
-      6. Log forced SELL signals to the feedback-loop log.
+    Color rules:
+      🔴 — forced SELL (stop loss hit OR price ≥ analyst target)
+      🟡 — HOLD but in a warning zone (approaching target ≥ 90%
+           of analyst, OR within ~30% of the stop loss line)
+      🟢 — HOLD, position is healthy
     """
-    portfolio = load_portfolio()
-    if not portfolio:
-        send_telegram(
-            "Your portfolio is empty. Use /buy TICKER SHARES PRICE first.",
-            chat_id,
+    # 🔴 — hard SELL signals first.
+    if pl_pct is not None and pl_pct <= STOP_LOSS_PCT:
+        return "STRONG SELL", "🔴"
+    if (target is not None and current is not None
+            and current >= ABOVE_TARGET_FRACTION * target):
+        return "SELL", "🔴"
+
+    # 🟡 — HOLD with a watch flag.
+    if (target is not None and current is not None
+            and current >= APPROACH_TARGET_FRACTION * target):
+        return "HOLD", "🟡"
+    # Within 30% of the stop loss line is "approaching trouble".
+    if pl_pct is not None and pl_pct <= STOP_LOSS_PCT * 0.7:
+        return "HOLD", "🟡"
+
+    # 🟢 — healthy default.
+    return "HOLD", "🟢"
+
+
+def _fallback_reason(signal, color):
+    """Deterministic one-liner used when Claude is unavailable."""
+    if signal == "STRONG SELL":
+        return "Stop loss breached — capital protection rule triggered."
+    if signal == "SELL":
+        return "Price has reached analyst fair value, take profits."
+    if color == "🟡":
+        return "In warning zone — watch closely, consider trimming."
+    return "Position healthy, thesis intact."
+
+
+def _get_quick_reasons(positions_data):
+    """Single batched Claude call → {ticker: one-sentence reason}.
+
+    `positions_data` is a list of dicts with: ticker, signal, pl_pct,
+    current, entry, target, stop. Returns a dict keyed by ticker. On
+    any failure we fall back to the rule-based reason from
+    _fallback_reason() so /portfolio always renders.
+    """
+    fallback = {
+        p["ticker"]: _fallback_reason(p["signal"], p["color"])
+        for p in positions_data
+    }
+    if not ANTHROPIC_API_KEY or not positions_data:
+        return fallback
+
+    lines = []
+    for p in positions_data:
+        target_str = (
+            f"${p['target']:.2f}" if p["target"] is not None else "n/a"
         )
-        return
-
-    send_telegram("*Running daily portfolio monitor…*", chat_id)
-
-    tickers = list(portfolio.keys())
-    # Basic bulk fetch is sufficient for the lightweight monitor — gives us
-    # currentPrice, regularMarketPreviousClose, and the fresh analyst target.
-    fundamentals = fetch_fundamentals_bulk(tickers)
-
-    judged_positions = []
-    target_changes = []     # (ticker, old, new) — for any position
-    big_movers_3 = []       # >= 3% single-day move → trigger deep analysis
-    big_movers_5 = []       # >= 5% single-day move → urgent + target alert
-    new_above_alerts = []   # positions that just crossed above fair value
-    new_approach_alerts = []  # positions that just entered approach band
-    portfolio_dirty = False
-
-    for ticker, pos in portfolio.items():
-        f = fundamentals.get(ticker) or {}
-        current = f.get("currentPrice") or get_current_price(ticker)
-        prev_close = f.get("regularMarketPreviousClose")
-
-        if current is None:
-            judged_positions.append({
-                "ticker": ticker, "shares": pos["shares"],
-                "entry_price": pos["entry_price"], "current_price": None,
-                "analyst_target": _safe_target(pos.get("analyst_target")),
-                "pl_pct": None, "move_pct": None,
-                "pl_dollar": None,
-                "forced_signal": None,
-                "forced_reason": "could not fetch price",
-                "stop_loss_hit": False,
-            })
-            continue
-
-        shares = pos["shares"]
-        entry = pos["entry_price"]
-        pl_dollar = (current - entry) * shares
-        pl_pct = round(((current - entry) / entry) * 100, 2)
-
-        # Single-day % move — used to trigger 3%/5% behaviors below.
-        move_pct = None
-        if prev_close and prev_close > 0:
-            move_pct = ((current - prev_close) / prev_close) * 100
-
-        # Refresh the analyst target every morning (replaces the old monthly
-        # refresh). Any meaningful change resets the per-position alert flags
-        # so the new target gets a fresh evaluation.
-        old_target = _safe_target(pos.get("analyst_target"))
-        new_target = _safe_target(f.get("targetMeanPrice"))
-        if new_target is not None and (
-            old_target is None or abs(new_target - old_target) >= 0.01
-        ):
-            pos["analyst_target"] = new_target
-            pos["approach_alerted"] = False
-            pos["above_alerted"] = False
-            portfolio_dirty = True
-            if old_target is not None:
-                target_changes.append((ticker, old_target, new_target))
-        target = new_target if new_target is not None else old_target
-
-        forced_signal = None
-        forced_reason = None
-        stop_loss_hit = False
-        pct_of_target = None
-
-        # --- Hard stop loss (URGENT) ---
-        if pl_pct <= STOP_LOSS_PCT:
-            forced_signal = "SELL"
-            forced_reason = (
-                f"hard stop loss hit (P/L {pl_pct}% ≤ {STOP_LOSS_PCT}%)"
-            )
-            stop_loss_hit = True
-
-        # --- Above analyst fair value (soft warning, not URGENT) ---
-        elif target is not None and current >= ABOVE_TARGET_FRACTION * target:
-            pct_of_target = (current / target) * 100
-            forced_signal = "SELL"
-            forced_reason = (
-                f"ABOVE FAIR VALUE — ${current:.2f} ≥ ${target:.2f} "
-                f"({pct_of_target:.0f}% of target)"
-            )
-            if not pos.get("above_alerted"):
-                new_above_alerts.append((ticker, current, target, pct_of_target))
-                pos["above_alerted"] = True
-                pos["approach_alerted"] = True
-                portfolio_dirty = True
-
-        # --- Approaching fair value (soft alert, not a forced SELL) ---
-        elif target is not None and current >= APPROACH_TARGET_FRACTION * target:
-            pct_of_target = (current / target) * 100
-            if not pos.get("approach_alerted"):
-                new_approach_alerts.append((ticker, current, target, pct_of_target))
-                pos["approach_alerted"] = True
-                portfolio_dirty = True
-
-        judged_positions.append({
-            "ticker": ticker,
-            "shares": shares,
-            "entry_price": entry,
-            "current_price": current,
-            "analyst_target": target,
-            "pl_pct": pl_pct,
-            "pl_dollar": pl_dollar,
-            "move_pct": move_pct,
-            "forced_signal": forced_signal,
-            "forced_reason": forced_reason,
-            "stop_loss_hit": stop_loss_hit,
-        })
-
-        if move_pct is not None and abs(move_pct) >= 3.0:
-            big_movers_3.append((ticker, move_pct, dict(pos)))
-        if move_pct is not None and abs(move_pct) >= 5.0:
-            big_movers_5.append((
-                ticker, move_pct, current,
-                old_target, new_target,
-            ))
-
-    if portfolio_dirty:
-        save_portfolio(portfolio)
-
-    if not any(p["current_price"] for p in judged_positions):
-        send_telegram(
-            "Could not fetch current prices for any of your holdings.",
-            chat_id,
-        )
-        return
-
-    # ────────────────────────────────────────────────────────────────────
-    # 1) URGENT — stop-loss hits go FIRST, one dedicated message each.
-    # ────────────────────────────────────────────────────────────────────
-    for p in judged_positions:
-        if not p["stop_loss_hit"]:
-            continue
-        loss_dollar = abs(p["pl_dollar"]) if p["pl_dollar"] is not None else 0
-        # Format matches the user spec literally — no Markdown wrappers,
-        # single space around `|`, positive loss number (the word "Loss"
-        # already conveys direction).
-        send_telegram(
-            f"🚨 STOP LOSS HIT — {p['ticker']}\n"
-            f"Down {abs(p['pl_pct']):.1f}% from entry — exceeds "
-            f"{STOP_LOSS_PCT:.0f}% threshold\n"
-            f"Entry: ${p['entry_price']:.2f} | "
-            f"Current: ${p['current_price']:.2f} | "
-            f"Loss: ${loss_dollar:,.2f}\n"
-            f"Action: Sell immediately",
-            chat_id,
-        )
-
-    # ────────────────────────────────────────────────────────────────────
-    # 2) URGENT — single-day moves of >= 5% (with optional target shift).
-    # ────────────────────────────────────────────────────────────────────
-    for ticker, move_pct, current, old_t, new_t in big_movers_5:
-        msg = (
-            f"🚨 *BIG MOVE — {ticker}*\n"
-            f"{move_pct:+.1f}% today — now ${current:.2f}"
-        )
-        if old_t is not None and new_t is not None:
-            target_change_pct = ((new_t - old_t) / old_t) * 100
-            if abs(target_change_pct) >= 5.0:
-                msg += (
-                    f"\nAnalyst target *also revised*: "
-                    f"${old_t:.2f} → ${new_t:.2f} "
-                    f"({target_change_pct:+.1f}%) — re-evaluate the thesis."
-                )
-        send_telegram(msg, chat_id)
-
-    # ────────────────────────────────────────────────────────────────────
-    # 3) Soft warnings (no 🚨) — newly-above and newly-approaching.
-    # ────────────────────────────────────────────────────────────────────
-    for ticker, current, target, pct in new_above_alerts:
-        send_telegram(
-            f"⚠️ *{ticker}* ABOVE FAIR VALUE — strong sell signal.\n"
-            f"Price ${current:.2f} is {pct:.0f}% of analyst target "
-            f"${target:.2f}.",
-            chat_id,
-        )
-    for ticker, current, target, pct in new_approach_alerts:
-        send_telegram(
-            f"⚠️ *{ticker}* APPROACHING FAIR VALUE — consider selling.\n"
-            f"Price ${current:.2f} is {pct:.0f}% of analyst target "
-            f"${target:.2f}.",
-            chat_id,
-        )
-
-    # ────────────────────────────────────────────────────────────────────
-    # 4) Portfolio summary table — one compact line per position so the
-    #    whole portfolio fits in a single readable mobile screen.
-    # ────────────────────────────────────────────────────────────────────
-    table = ["*Portfolio summary*", ""]
-    for p in judged_positions:
-        if p["current_price"] is None:
-            table.append(f"⚪ {p['ticker']} — price unavailable")
-            continue
-        signal = p["forced_signal"] or "HOLD"
-        if signal == "SELL":
-            emoji = "🔴"
-        elif p["pl_pct"] >= 0:
-            emoji = "🟢"
-        else:
-            emoji = "🟡"
-        move = (
-            f" ({p['move_pct']:+.1f}%t)"
-            if p["move_pct"] is not None else ""
-        )
-        table.append(
-            f"{emoji} *{p['ticker']}* ${p['current_price']:.2f}{move} "
-            f"— *{signal}* {p['pl_pct']:+.1f}%"
-        )
-    if target_changes:
-        table.append("")
-        table.append("_Targets refreshed today:_")
-        for t, old, new in target_changes:
-            arrow = "↑" if new > old else "↓"
-            table.append(f"  • {t}: ${old:.2f} → ${new:.2f} {arrow}")
-    send_telegram("\n".join(table), chat_id)
-
-    # ────────────────────────────────────────────────────────────────────
-    # 5) One message per HEALTHY position with a compact analysis block.
-    #    Forced-SELL positions already got their own dedicated alerts.
-    # ────────────────────────────────────────────────────────────────────
-    healthy = [
-        p for p in judged_positions
-        if p["forced_signal"] is None and p["current_price"] is not None
-    ]
-    mover_set = {t for t, _, _ in big_movers_3}
-    for p in healthy:
-        signal_emoji = "🟢" if p["pl_pct"] >= 0 else "🟡"
-        lines = [f"{signal_emoji} *{p['ticker']}* — *HOLD*"]
-        move_str = (
-            f" ({p['move_pct']:+.2f}% today)"
-            if p["move_pct"] is not None else ""
-        )
+        stop_state = "OK"
+        if p["current"] is not None and p["current"] < p["stop"]:
+            stop_state = "BREACHED"
         lines.append(
-            f"Price: ${p['current_price']:.2f}{move_str}"
+            f"- {p['ticker']}: signal={p['signal']}, "
+            f"P/L {p['pl_pct']:+.1f}%, current ${p['current']:.2f}, "
+            f"entry ${p['entry']:.2f}, analyst target {target_str}, "
+            f"stop ${p['stop']:.2f} ({stop_state})"
         )
-        sign = "+" if p["pl_dollar"] >= 0 else "-"
-        lines.append(
-            f"P&L: {sign}${abs(p['pl_dollar']):,.2f} "
-            f"({p['pl_pct']:+.2f}%) · entry ${p['entry_price']:.2f} × "
-            f"{p['shares']} shares"
-        )
-        if p["analyst_target"] is not None:
-            upside_pct = (
-                ((p["analyst_target"] - p["current_price"])
-                 / p["current_price"]) * 100
-            )
-            lines.append(
-                f"Target: ${p['analyst_target']:.2f} "
-                f"({upside_pct:+.1f}% upside)"
-            )
-        if p["ticker"] in mover_set:
-            lines.append(
-                "_Moved 3%+ today — auto deep analysis on the way._"
-            )
-        send_telegram("\n".join(lines), chat_id)
-
-    # ────────────────────────────────────────────────────────────────────
-    # 6) Final action / cash / redeployment message.
-    # ────────────────────────────────────────────────────────────────────
-    sell_positions = [
-        p for p in judged_positions if p["forced_signal"] == "SELL"
-        and p["current_price"] is not None
-    ]
-    approach_tickers = [t for t, _, _, _ in new_approach_alerts]
-    final_lines = ["*Action summary*", ""]
-    if sell_positions:
-        freed_cash = sum(
-            p["current_price"] * p["shares"] for p in sell_positions
-        )
-        sell_tickers = ", ".join(p["ticker"] for p in sell_positions)
-        final_lines.append(
-            f"💰 *Cash if you execute today's SELLs* ({sell_tickers}): "
-            f"~${freed_cash:,.2f}"
-        )
-        final_lines.append(
-            "Run /monthly to find redeployment candidates from the "
-            "S&P 500 buy screen."
-        )
-    elif approach_tickers:
-        final_lines.append(
-            f"Consider trimming {', '.join(approach_tickers)} — "
-            "approaching analyst fair value."
-        )
-        final_lines.append("Run /monthly when you're ready to redeploy.")
-    else:
-        final_lines.append(
-            "✅ All positions look healthy — no action required today."
-        )
-    send_telegram("\n".join(final_lines), chat_id)
-
-    # ────────────────────────────────────────────────────────────────────
-    # Background — auto-trigger deep analysis on every >=3% mover.
-    # ────────────────────────────────────────────────────────────────────
-    for ticker, move_pct, position in big_movers_3:
-        Thread(
-            target=_trigger_deep_for_mover,
-            args=(ticker, move_pct, position, chat_id),
-            daemon=True,
-        ).start()
-
-    # --- Feedback loop — log forced SELL signals from the daily monitor ---
+    prompt = (
+        "You are a concise portfolio analyst. For each position below, "
+        "write ONE short sentence (max 14 words) explaining why the given "
+        "signal is appropriate. Be specific to the ticker — mention "
+        "valuation, momentum, fundamentals, or risk briefly. End each "
+        "sentence with a period.\n\n"
+        "Positions:\n" + "\n".join(lines) + "\n\n"
+        "Output STRICTLY valid JSON only (no markdown, no preamble, no "
+        "trailing text). Schema:\n"
+        '{"TICKER1": "reason sentence.", "TICKER2": "..."}'
+    )
     try:
-        sells = [
-            {
-                "ticker": p["ticker"],
-                "total_score": None,
-                "signal": "SELL",
-                "claude_target": None,
-                "stop_loss": None,
-                "bull_case": None,
-                "bear_case": p["forced_reason"],
-            }
-            for p in judged_positions if p["forced_signal"] == "SELL"
-        ]
-        price_by_t = {p["ticker"]: p["current_price"] for p in judged_positions}
-        target_by_t = {p["ticker"]: p["analyst_target"] for p in judged_positions}
-        log_recommendations(
-            sells,
-            price_lookup=lambda t: price_by_t.get(t),
-            analyst_lookup=lambda t: target_by_t.get(t),
-            source="daily",
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
         )
+        text = next(
+            (b.text for b in msg.content if hasattr(b, "text")), ""
+        ).strip()
+        # Claude can wrap JSON in fences or add prose around it — pull out
+        # the first {...} block defensively.
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return fallback
+        parsed = json.loads(m.group(0))
+        if not isinstance(parsed, dict):
+            return fallback
+        # Merge — Claude may skip a ticker; the fallback fills the gap.
+        out = dict(fallback)
+        for k, v in parsed.items():
+            if isinstance(v, str) and v.strip():
+                out[k] = v.strip()
+        return out
     except Exception as exc:
-        print(f"[recs] daily SELL logging failed: {exc}")
+        print(f"[quick-reasons] Claude call failed: {exc}")
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -2210,6 +1949,9 @@ def handle_trim(args, chat_id):
 
 
 def handle_portfolio(chat_id):
+    """Unified daily view — one Telegram message per position (🔴 → 🟡 → 🟢
+    order) followed by a single summary message. Replaces the old separate
+    /portfolio + /analyze split."""
     portfolio = load_portfolio()
     if not portfolio:
         send_telegram(
@@ -2218,37 +1960,23 @@ def handle_portfolio(chat_id):
         )
         return
 
-    lines = ["*Your Portfolio*", ""]
-    total_cost = 0.0
-    total_value = 0.0
-
     # Stop loss is negative (e.g. -7) — convert to a price multiplier.
     stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)  # e.g. 0.93
 
-    # Bulk-fetch current prices + analyst targets in one shot. Lazily fill
-    # any missing analyst_target on existing positions while we're at it.
+    # Bulk-fetch fundamentals once. Lazily backfill any missing analyst
+    # target on existing positions while we're at it.
     tickers = list(portfolio.keys())
     fundamentals = fetch_fundamentals_bulk(tickers)
     portfolio_dirty = False
 
-    # Top-of-message health summary — reuses the bulk fundamentals we just
-    # fetched so this adds zero extra API calls.
-    try:
-        health = calculate_health_score(portfolio, fundamentals)
-        summary = format_health_summary(health)
-        if summary:
-            lines.insert(1, summary)
-    except Exception as exc:
-        print(f"[health] portfolio summary failed: {exc}")
-
+    # ── Build per-position record (everything needed to render + sort) ──
+    records = []
     for ticker, pos in portfolio.items():
         shares = pos["shares"]
         entry = pos["entry_price"]
         f = fundamentals.get(ticker)
         current = (f or {}).get("currentPrice") or get_current_price(ticker)
 
-        # Resolve analyst target: stored value wins, else live fetch & persist.
-        # _safe_target normalises 0/NaN/None so display & math stay consistent.
         target = _safe_target(pos.get("analyst_target"))
         if target is None and f:
             live_target = _safe_target(f.get("targetMeanPrice"))
@@ -2259,89 +1987,173 @@ def handle_portfolio(chat_id):
 
         stop_price = entry * stop_factor
 
-        # First line: ticker, shares, entry price
-        lines.append(f"*{ticker}* — {shares} shares @ ${entry:.2f}")
-
         if current is None:
-            lines.append("Current: _price unavailable_")
-            lines.append(
-                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) | "
-                f"Target: "
-                + (f"${target:.2f}" if target else "_unavailable_")
-            )
-            lines.append("")
+            records.append({
+                "ticker": ticker, "shares": shares, "entry": entry,
+                "current": None, "target": target, "stop": stop_price,
+                "pl_dollar": None, "pl_pct": None,
+                "signal": "HOLD", "color": "⚪",
+                "reason": "Price unavailable — could not fetch quote.",
+            })
             continue
 
         pl_dollar = (current - entry) * shares
         pl_pct = ((current - entry) / entry) * 100
-        # Tri-state emoji: green above entry, yellow between entry & stop,
-        # red at or below the stop loss.
-        pl_emoji = _status_emoji(pl_pct)
-        pl_sign = "+" if pl_dollar >= 0 else "-"
-
-        # Line 2: Current vs Entry, P&L
-        lines.append(
-            f"Entry ${entry:.2f} → Current ${current:.2f} | "
-            f"P&L: {pl_sign}${abs(pl_dollar):.2f} "
-            f"({pl_sign}{abs(pl_pct):.1f}%) {pl_emoji}"
-        )
-
-        # Line 3: Analyst target + % upside remaining (or "above target")
-        if target:
-            upside_pct = ((target - current) / current) * 100
-            if upside_pct >= 0:
-                target_label = (
-                    f"Target ${target:.2f} | "
-                    f"Upside: +{upside_pct:.1f}% "
-                    f"(${target - current:+.2f}/share)"
-                )
-            else:
-                # Above the analyst target — show how far past
-                pct_of_target = (current / target) * 100
-                target_label = (
-                    f"Target ${target:.2f} | "
-                    f"*Above target* — {pct_of_target:.0f}% of target "
-                    f"(${current - target:+.2f}/share over)"
-                )
-        else:
-            target_label = "Target _unavailable_"
-
-        lines.append(target_label)
-
-        # Line 4: stop loss price + distance
-        dist_to_stop = current - stop_price
-        if dist_to_stop >= 0:
-            stop_label = (
-                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) → "
-                f"${dist_to_stop:.2f}/share above stop"
-            )
-        else:
-            stop_label = (
-                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) → "
-                f"*${abs(dist_to_stop):.2f}/share BELOW stop*"
-            )
-        lines.append(stop_label)
-
-        total_cost += entry * shares
-        total_value += current * shares
-        lines.append("")  # blank line between positions
+        signal, color = _quick_judge_position(pl_pct, current, target)
+        records.append({
+            "ticker": ticker, "shares": shares, "entry": entry,
+            "current": current, "target": target, "stop": stop_price,
+            "pl_dollar": pl_dollar, "pl_pct": pl_pct,
+            "signal": signal, "color": color, "reason": None,
+        })
 
     if portfolio_dirty:
         save_portfolio(portfolio)
 
-    if total_cost > 0:
-        total_pl = total_value - total_cost
-        total_pct = (total_pl / total_cost) * 100
-        emoji = "🟢" if total_pl >= 0 else "🔴"
-        sign = "+" if total_pl >= 0 else "-"
-        lines.append(
-            f"*Total* — Cost: ${total_cost:.2f} | "
-            f"Value: ${total_value:.2f} | "
-            f"P&L: {sign}${abs(total_pl):.2f} "
-            f"({sign}{abs(total_pct):.1f}%) {emoji}"
+    # ── Single batched Claude call → one-sentence reason per position ──
+    judged = [r for r in records if r["current"] is not None]
+    reasons = _get_quick_reasons(judged)
+    for r in records:
+        if r["reason"] is None:
+            r["reason"] = reasons.get(
+                r["ticker"], _fallback_reason(r["signal"], r["color"])
+            )
+
+    # ── Sort: 🔴 first, 🟡 second, 🟢 last, ⚪ (price-unavailable) at end ──
+    color_order = {"🔴": 0, "🟡": 1, "🟢": 2, "⚪": 3}
+    records.sort(key=lambda r: (color_order.get(r["color"], 9), r["ticker"]))
+
+    # ── Send ONE Telegram message per position in the sorted order ──
+    for r in records:
+        if r["current"] is None:
+            send_telegram(
+                f"{r['color']} {r['ticker']} — price unavailable\n"
+                f"{r['shares']} shares | Entry ${r['entry']:.2f}\n"
+                f"Reason: {r['reason']}",
+                chat_id,
+                parse_mode=None,
+            )
+            continue
+
+        pl_sign = "+" if r["pl_dollar"] >= 0 else "-"
+        pl_line = (
+            f"P&L: {pl_sign}${abs(r['pl_dollar']):.2f} "
+            f"({r['pl_pct']:+.1f}%)"
         )
 
-    send_telegram("\n".join(lines), chat_id)
+        if r["target"] is not None:
+            # Single literal template per spec: "(X% upside)". When
+            # current price is above the analyst target, X comes out
+            # negative — the explicit sign keeps the meaning unambiguous.
+            upside_pct = ((r["target"] - r["current"]) / r["current"]) * 100
+            target_str = (
+                f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside)"
+            )
+        else:
+            target_str = "Target: n/a"
+
+        dist_to_stop = r["current"] - r["stop"]
+        if dist_to_stop >= 0:
+            stop_line = (
+                f"Stop: ${r['stop']:.2f} | Safe by ${dist_to_stop:.2f}"
+            )
+        else:
+            stop_line = (
+                f"Stop: ${r['stop']:.2f} | "
+                f"BELOW stop by ${abs(dist_to_stop):.2f}"
+            )
+
+        send_telegram(
+            f"{r['color']} {r['ticker']} — {r['signal']}\n"
+            f"{r['shares']} shares | Entry ${r['entry']:.2f} → "
+            f"Current ${r['current']:.2f}\n"
+            f"{pl_line} | {target_str}\n"
+            f"{stop_line}\n"
+            f"Reason: {r['reason']}",
+            chat_id,
+            parse_mode=None,
+        )
+
+    # ── Final summary message ───────────────────────────────────────────
+    priced = [r for r in records if r["current"] is not None]
+    total_cost = sum(r["entry"] * r["shares"] for r in priced)
+    total_value = sum(r["current"] * r["shares"] for r in priced)
+    total_pl = total_value - total_cost
+    total_pct = (total_pl / total_cost * 100) if total_cost > 0 else 0
+    pl_sign = "+" if total_pl >= 0 else "-"
+
+    # Health score — reuse the bulk fundamentals so zero extra API calls.
+    health_line = ""
+    try:
+        health = calculate_health_score(portfolio, fundamentals)
+        if health is not None:
+            health_line = (
+                f"Health score: {health['score']}/10 "
+                f"{health['rating_emoji']}\n"
+            )
+    except Exception as exc:
+        print(f"[health] portfolio summary failed: {exc}")
+
+    # "Cash available to deploy" — derived from forced SELLs (the bot
+    # doesn't track a cash balance separately). If you execute today's
+    # SELLs, you free up this much capital.
+    sell_records = [r for r in priced if r["color"] == "🔴"]
+    freed_cash = sum(r["current"] * r["shares"] for r in sell_records)
+
+    # Reason tag for each red position.
+    red_with_reason = []
+    for r in sell_records:
+        if r["signal"] == "STRONG SELL":
+            tag = "below stop loss"
+        elif r["signal"] == "SELL":
+            tag = "above target"
+        else:
+            tag = "needs review"
+        red_with_reason.append((r["ticker"], tag))
+
+    if red_with_reason:
+        # Group by reason for a cleaner string e.g.  "CRM, ADSK (below stop loss)"
+        by_tag = {}
+        for t, tag in red_with_reason:
+            by_tag.setdefault(tag, []).append(t)
+        action_parts = [
+            f"{', '.join(ts)} ({tag})" for tag, ts in by_tag.items()
+        ]
+        action_line = "Positions needing action: " + "; ".join(action_parts)
+    else:
+        action_line = "Positions needing action: none — all clear."
+
+    # Strongest position — highest P&L % among healthy holdings (🟢).
+    healthy = [r for r in priced if r["color"] == "🟢"]
+    if healthy:
+        top = max(healthy, key=lambda r: r["pl_pct"])
+        if top["target"] is not None:
+            top_upside = (
+                ((top["target"] - top["current"]) / top["current"]) * 100
+            )
+            strongest_line = (
+                f"Strongest position: {top['ticker']} "
+                f"({top['pl_pct']:+.1f}%, {top_upside:.0f}% upside)"
+            )
+        else:
+            strongest_line = (
+                f"Strongest position: {top['ticker']} ({top['pl_pct']:+.1f}%)"
+            )
+    else:
+        strongest_line = "Strongest position: n/a (no green positions)"
+
+    summary_lines = [
+        "📊 PORTFOLIO SUMMARY",
+        f"Total value: ${total_value:,.0f} | "
+        f"P&L: {pl_sign}${abs(total_pl):,.0f} ({total_pct:+.1f}%)",
+    ]
+    if health_line:
+        summary_lines.append(health_line.rstrip())
+    summary_lines.append(f"Cash available to deploy: ${freed_cash:,.0f}")
+    summary_lines.append("")
+    summary_lines.append(action_line)
+    summary_lines.append(strongest_line)
+    send_telegram("\n".join(summary_lines), chat_id, parse_mode=None)
 
 
 def handle_deep(args, chat_id):
@@ -2407,10 +2219,9 @@ def handle_start(chat_id):
         "`/buy TICKER SHARES PRICE` — add a position\n"
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
-        "`/portfolio` — holdings with live P&L, analyst target & upside\n"
+        "`/portfolio` — unified daily view (one msg per position + summary)\n"
         "`/health` — portfolio health score (0–10) with breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
-        "`/analyze` — daily 5-pillar review on holdings\n"
         "`/deep TICKER` — full 5-pillar deep dive on any stock\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
@@ -2468,13 +2279,16 @@ def poll_telegram():
                     elif cmd == "/trim":
                         handle_trim(args, chat_id)
                     elif cmd == "/portfolio":
-                        handle_portfolio(chat_id)
-                    elif cmd == "/analyze":
-                        # Acknowledge immediately, then run analysis in a
-                        # background thread so polling stays responsive.
-                        send_telegram("Analysis started, please wait...", chat_id)
+                        # The unified daily view does live yfinance fetches
+                        # plus a Claude reasoning call — push it off the
+                        # polling thread so /portfolio stays responsive.
+                        send_telegram(
+                            "Building your daily portfolio view...", chat_id
+                        )
                         Thread(
-                            target=run_analysis, args=(chat_id,), daemon=True
+                            target=handle_portfolio,
+                            args=(chat_id,),
+                            daemon=True,
                         ).start()
                     elif cmd == "/earnings":
                         handle_earnings(chat_id)
@@ -3141,22 +2955,20 @@ def scheduled_run():
     if chat_id is None:
         print("Skipping scheduled run — no chat has interacted with the bot yet.")
         return
-    # The daily monitor itself now refreshes analyst targets for every
-    # holding on every run, so the old day-1-of-month bulk refresh is
-    # no longer needed.
-    run_analysis(chat_id)
+    # Same unified daily view as /portfolio — one message per position in
+    # 🔴 → 🟡 → 🟢 order, then a summary message. Analyst targets are
+    # refreshed inline so the old monthly bulk refresh is no longer needed.
+    handle_portfolio(chat_id)
 
 
 schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
-# Daily monitor runs at 21:30 UTC — 30 min after US market close
-# (16:00 ET = 20:00/21:00 UTC depending on DST). This is the earliest
-# point at which currentPrice and regularMarketPreviousClose differ in
-# a way that lets the >3% / >5% mover logic actually fire — running it
-# pre-open would compare yesterday's close to itself.
-schedule.every().day.at("21:30", "UTC").do(scheduled_run)
+# Unified daily portfolio view at 09:00 UTC — pre-US-open. Uses analyst
+# targets + last-known prices to deliver the morning briefing before the
+# market moves.
+schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 
 
 # ---------------------------------------------------------------------------
@@ -3174,8 +2986,8 @@ if __name__ == "__main__":
     from dashboard import start_dashboard
     Thread(target=start_dashboard, daemon=True).start()
 
-    print("Portfolio Bot started. Daily analysis scheduled at 21:30 UTC "
-          "(post US market close).")
+    print("Portfolio Bot started. Unified /portfolio view scheduled at "
+          "09:00 UTC daily.")
     while True:
         schedule.run_pending()
         time.sleep(30)

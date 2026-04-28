@@ -63,7 +63,6 @@ Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the
   - **Earnings trend** — last 4 reported EPS via `get_earnings_dates(limit=12)` → 3 q/q growth rates → `accelerating` / `decelerating` / `mixed` / `insufficient`.
 - **5-pillar Claude prompt** (`FRAMEWORK_INSTRUCTIONS`): Business Quality / Growth Trajectory / Valuation / Catalyst / Risk, each scored 1-5. Total /25 → **STRONG BUY 20-25, BUY 15-19, HOLD 10-14, SELL <10**. Each pick gets concrete price target, stop loss, time horizon (weeks), bull/bear paragraphs.
 - Used by:
-  - `/analyze` daily monitor — batch call scores all non-forced positions.
   - `/monthly` — basic fetch on SP500 → hard filter → rich fetch only on the survivors → framework + top-2 pick.
   - `/deep TICKER` — single-stock on-demand deep dive.
 
@@ -115,29 +114,33 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 - 07:30 — recommendation review check (4w/8w grading)
 - 08:00 — earnings calendar sweep (and Sunday-only weekly summary)
 - 08:30 — morning portfolio health score push
-- 21:30 — lightweight daily monitor (runs 30 min after US market close
-  so today's % move from `regularMarketPreviousClose` is meaningful;
-  a pre-open run would compare yesterday's close to itself and the
-  >3% mover trigger would never fire)
+- 09:00 — unified `/portfolio` daily review (one msg per position +
+  summary). Pre-US-open briefing using analyst targets + last-known
+  prices.
 
-### Daily Monitor (lightweight)
-- Bulk-fetches basic fundamentals (one API call) → gives current price,
-  previous close, and fresh analyst target for every holding.
-- **Refreshes the analyst target on every position every run** (replaces
-  the old day-1-of-month bulk refresh). Resets the per-position alert
-  flags whenever the target changes meaningfully.
-- One-line-per-position summary with hard-rule SELL signals (stop-loss,
-  above analyst fair value) — no Claude framework call by default.
-- **>3% single-day move →** auto-fires `analyze_stock_deep` in a
-  background thread for that ticker, sends the full 5-pillar analysis
-  to Telegram, and logs it to the feedback loop with `source=daily-mover`.
-- **>5% single-day move →** also alerts if the analyst target shifted
-  by ≥5% on the same day ("re-evaluate the thesis").
+### Unified `/portfolio` (daily view)
+- Replaces the old separate `/portfolio` (snapshot) and `/analyze`
+  (batched daily monitor) commands with a single command and a single
+  scheduled push at 09:00 UTC.
+- Bulk-fetches fundamentals once (one API call), then for every
+  position: applies rule-based signal+color via `_quick_judge_position`
+  (🔴 STRONG SELL stop-loss / 🔴 SELL above target / 🟡 HOLD warning
+  near stop or near target / 🟢 HOLD healthy).
+- Single batched Claude call (`_get_quick_reasons`, claude-opus-4-5,
+  JSON output, ≤600 tokens) returns one-sentence reasoning per ticker.
+  Falls back to deterministic `_fallback_reason` text if Claude is
+  unavailable / errors / parses badly — never blocks the user.
+- Sends **one Telegram message per position** in 🔴 → 🟡 → 🟢 → ⚪ order
+  (color, ticker, signal / shares + entry → current / P&L + target with
+  upside or "above target" / Stop + Safe by/BELOW stop / Reason), then a
+  final 📊 PORTFOLIO SUMMARY message (total value, P&L, health score,
+  cash freed if today's SELLs are executed, action items grouped by
+  reason, strongest healthy position with upside).
 - `/buy` separately triggers its own deep analysis on the new position
   (background thread → confirmation Telegram + feedback-loop log).
 
 ### Commands
-`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`
+`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`
 
 ### Web Dashboard (`portfolio-bot/dashboard.py`)
 - Separate Flask app started in its own daemon thread from `main.py`.
