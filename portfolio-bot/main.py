@@ -46,7 +46,7 @@ def home():
 
 def keep_alive():
     """Run the Flask server. Started in a background thread."""
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 
 # ---------------------------------------------------------------------------
@@ -336,49 +336,60 @@ def handle_start(chat_id):
 # Telegram long-polling loop (runs in a background thread)
 # ---------------------------------------------------------------------------
 def poll_telegram():
+    """Long-poll Telegram forever. Any error is logged and the loop restarts."""
     last_update_id = 0
+    print("Telegram polling loop started.")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 30}
-            res = requests.get(url, params=params, timeout=35).json()
+            res = requests.get(url, params=params, timeout=40).json()
 
             for update in res.get("result", []):
                 last_update_id = update["update_id"]
-                msg = update.get("message")
-                if not msg or "text" not in msg:
-                    continue
+                try:
+                    msg = update.get("message")
+                    if not msg or "text" not in msg:
+                        print(f"[update {last_update_id}] no text, skipping")
+                        continue
 
-                text = msg["text"].strip()
-                chat_id = msg["chat"]["id"]
-                remember_chat(chat_id)
+                    text = msg["text"].strip()
+                    chat_id = msg["chat"]["id"]
+                    user = msg.get("from", {}).get("username", "unknown")
+                    print(f"[incoming] chat={chat_id} user=@{user} text={text!r}")
+                    remember_chat(chat_id)
 
-                if not text.startswith("/"):
-                    continue
+                    if not text.startswith("/"):
+                        continue
 
-                parts = text.split()
-                cmd = parts[0].split("@")[0]   # strip @BotName if present
-                args = parts[1:]
+                    parts = text.split()
+                    cmd = parts[0].split("@")[0]   # strip @BotName if present
+                    args = parts[1:]
 
-                if cmd == "/start" or cmd == "/help":
-                    handle_start(chat_id)
-                elif cmd == "/buy":
-                    handle_buy(args, chat_id)
-                elif cmd == "/sell":
-                    handle_sell(args, chat_id)
-                elif cmd == "/portfolio":
-                    handle_portfolio(chat_id)
-                elif cmd == "/analyze":
-                    # Run analysis in a thread so polling stays responsive
-                    Thread(
-                        target=run_analysis, args=(chat_id,), daemon=True
-                    ).start()
-                else:
-                    send_telegram(
-                        "Unknown command. Send /help for the list.", chat_id
-                    )
+                    if cmd == "/start" or cmd == "/help":
+                        handle_start(chat_id)
+                    elif cmd == "/buy":
+                        handle_buy(args, chat_id)
+                    elif cmd == "/sell":
+                        handle_sell(args, chat_id)
+                    elif cmd == "/portfolio":
+                        handle_portfolio(chat_id)
+                    elif cmd == "/analyze":
+                        # Acknowledge immediately, then run analysis in a
+                        # background thread so polling stays responsive.
+                        send_telegram("Analysis started, please wait...", chat_id)
+                        Thread(
+                            target=run_analysis, args=(chat_id,), daemon=True
+                        ).start()
+                    else:
+                        send_telegram(
+                            "Unknown command. Send /help for the list.", chat_id
+                        )
+                except Exception as inner:
+                    # Never let one bad update kill the loop.
+                    print(f"Error handling update {last_update_id}: {inner}")
         except Exception as e:
-            print(f"Polling error: {e}")
+            print(f"Polling error (will retry in 5s): {e}")
             time.sleep(5)
 
 

@@ -1,0 +1,22 @@
+{
+  "CRM": {
+    "shares": 2.0,
+    "entry_price": 263.42,
+    "added": "2026-04-28T14:39:58"
+  },
+  "NIO": {
+    "shares": 38.0,
+    "entry_price": 238.64,
+    "added": "2026-04-28T14:41:31"
+  },
+  "ADSK": {
+    "shares": 2.0,
+    "entry_price": 305.93,
+    "added": "2026-04-28T14:42:22"
+  },
+  "SNOW": {
+    "shares": 4.0,
+    "entry_price": 224.96,
+    "added": "2026-04-28T14:43:00"
+  }
+}
