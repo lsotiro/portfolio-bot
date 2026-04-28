@@ -9,11 +9,6 @@
     "entry_price": 305.93,
     "added": "2026-04-28T14:42:22"
   },
-  "SNOW": {
-    "shares": 4.0,
-    "entry_price": 224.96,
-    "added": "2026-04-28T14:43:00"
-  },
   "NIO": {
     "shares": 38.0,
     "entry_price": 7.9,
@@ -24,5 +19,15 @@
     "entry_price": 174.92,
     "added": "2026-04-28T14:50:54",
     "partial_alerted": true
+  },
+  "SCHW": {
+    "shares": 4.0,
+    "entry_price": 90.84,
+    "added": "2026-04-28T15:37:16"
+  },
+  "AVGO": {
+    "shares": 2.0,
+    "entry_price": 396.28,
+    "added": "2026-04-28T15:37:52"
   }
 }

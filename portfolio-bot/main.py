@@ -11,9 +11,12 @@ Commands you can send the bot:
 Once a day at 09:00 UTC the bot also runs /analyze automatically.
 
 Hard rules applied to every holding before Claude is consulted:
-  - Stop loss   : forced SELL if down 7% or more from entry
-  - Partial TP  : alert at +15% (consider selling 50%)
+  - Stop loss   : forced SELL if down 7% or more from entry (capital protection)
   - Full TP     : forced SELL alert at +25% (consider exiting fully)
+  - Fair value  : forced SELL when price ≥ 90% of analyst consensus target
+                  (close to fair value — limited remaining upside)
+  - Partial TP  : alert at +15% (consider selling 50%)
+HOLD remains the default whenever none of these trigger and Claude agrees.
 """
 
 import json
@@ -31,9 +34,10 @@ import yfinance as yf
 from flask import Flask
 
 # Hard trade rules (always override fundamentals)
-STOP_LOSS_PCT = -7.0       # forced SELL at -7%
-PARTIAL_PROFIT_PCT = 15.0  # alert only — suggest selling 50%
-TAKE_PROFIT_PCT = 25.0     # forced SELL at +25%
+STOP_LOSS_PCT = -7.0          # forced SELL at -7% (capital protection)
+PARTIAL_PROFIT_PCT = 15.0     # alert only — suggest selling 50%
+TAKE_PROFIT_PCT = 25.0        # forced SELL at +25%
+NEAR_TARGET_FRACTION = 0.90   # forced SELL when price ≥ 90% of analyst target
 
 # Buy-screen filters (tighter — quality businesses only)
 SCREEN_MIN_REVENUE_GROWTH = 0.15     # > 15%
@@ -368,6 +372,11 @@ fundamentals AND news together. Consider:
   - news flow / sentiment shifts
   - momentum reversal or clearly stronger opportunities elsewhere
 
+Default to HOLD when the stock is still meaningfully below its analyst
+consensus target (significant remaining upside) and fundamentals/news are
+not deteriorating. Lean SELL when the upside to target has largely been
+captured even if no hard rule has triggered yet.
+
 ADDITIONALLY, scan the news for any CRITICAL negative event for any holding:
   - accounting scandal or fraud
   - earnings / guidance cut, missed forecast
@@ -585,6 +594,29 @@ def run_analysis(chat_id):
                 # Treat partial as also resolved so we don't re-fire it
                 pos["partial_alerted"] = True
                 portfolio_dirty = True
+
+        # --- Near analyst fair value (price ≥ 90% of consensus target) ---
+        # Only fires when fundamentals provide a target. HOLD if still far below.
+        elif (
+            f
+            and f.get("targetMeanPrice")
+            and current >= NEAR_TARGET_FRACTION * f["targetMeanPrice"]
+        ):
+            target = f["targetMeanPrice"]
+            pct_of_target = (current / target) * 100
+            forced_signal = "SELL"
+            forced_reason = (
+                f"near analyst fair value "
+                f"(${current:.2f} ≥ {NEAR_TARGET_FRACTION:.0%} of "
+                f"${target:.2f} target — {pct_of_target:.0f}% of target)"
+            )
+            # Soft alert (don't gate on partial/full flags — this is its own rule)
+            send_telegram(
+                f"⚠️ *{ticker}* near fair value — price ${current:.2f} is "
+                f"{pct_of_target:.0f}% of analyst target ${target:.2f}. "
+                f"Consider selling — limited remaining upside.",
+                chat_id,
+            )
 
         # --- Partial take profit at +15% (alert once, no forced SELL) ---
         elif pl_pct >= PARTIAL_PROFIT_PCT:
@@ -948,7 +980,10 @@ def handle_start(chat_id):
         "`/portfolio` — holdings with live P&L + stop/TP distances\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
-        "_Hard rules: forced SELL at -7% stop loss or +25% take profit._\n"
+        "_Hard SELL rules:_\n"
+        "_• -7% stop loss (capital protection)_\n"
+        "_• +25% full take profit_\n"
+        "_• price ≥ 90% of analyst target (near fair value)_\n"
         "_Soft alert: PARTIAL SELL (50%) at +15%._",
         chat_id,
     )
