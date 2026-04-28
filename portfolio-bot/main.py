@@ -44,6 +44,20 @@ APPROACH_TARGET_FRACTION = 0.90   # soft alert when price ≥ 90% of target
 LOW_TARGET_FRACTION = 0.70        # info: price ≤ 70% of target → big upside
 
 
+def _status_emoji(pl_pct):
+    """Three-state P&L emoji.
+
+    🟢 green  — current price ≥ entry (positive P&L)
+    🟡 yellow — below entry but still above the -7% stop loss
+    🔴 red    — at/below the stop loss (urgent action needed)
+    """
+    if pl_pct >= 0:
+        return "🟢"
+    if pl_pct > STOP_LOSS_PCT:
+        return "🟡"
+    return "🔴"
+
+
 def _safe_target(value):
     """Return value if it is a positive number, else None.
 
@@ -710,7 +724,34 @@ def run_analysis(chat_id):
     for line in urgent:
         send_telegram(f"🚨 *URGENT* — {line}", chat_id)
 
+    # Position status block — coloured one-line summary per holding so the
+    # report is scannable at a glance.
+    status_lines = []
+    for p in judged_positions:
+        ticker = p["ticker"]
+        cur = p["current_price"]
+        entry = p["entry_price"]
+        plp = p["pl_pct"]
+        emo = _status_emoji(plp)
+        stop_price = entry * (1.0 + STOP_LOSS_PCT / 100.0)
+        sign = "+" if plp >= 0 else "-"
+        if plp >= 0:
+            tail = f"+{plp:.1f}% above entry"
+        elif plp > STOP_LOSS_PCT:
+            cushion_pct = ((cur - stop_price) / stop_price) * 100
+            tail = (
+                f"{sign}{abs(plp):.1f}% below entry — "
+                f"{cushion_pct:.1f}% above stop"
+            )
+        else:
+            tail = f"{sign}{abs(plp):.1f}% — *BELOW STOP — urgent*"
+        status_lines.append(f"{emo} *{ticker}* — {tail}")
+
     sections = ["*Daily Portfolio Report*", ""]
+    if status_lines:
+        sections.append("*Holdings status:*")
+        sections.extend(status_lines)
+        sections.append("")
     if forced_lines:
         sections.append("*Hard-rule SELLs (override fundamentals):*")
         sections.extend(forced_lines)
@@ -990,7 +1031,9 @@ def handle_portfolio(chat_id):
 
         pl_dollar = (current - entry) * shares
         pl_pct = ((current - entry) / entry) * 100
-        pl_emoji = "🟢" if pl_dollar >= 0 else "🔴"
+        # Tri-state emoji: green above entry, yellow between entry & stop,
+        # red at or below the stop loss.
+        pl_emoji = _status_emoji(pl_pct)
         pl_sign = "+" if pl_dollar >= 0 else "-"
 
         # Line 2: Current vs Entry, P&L
