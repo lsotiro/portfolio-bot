@@ -1198,8 +1198,11 @@ def score_momentum_bulk(tickers, fundamentals=None, news_map=None):
 def get_momentum_signal(score):
     """Map a 0-100 momentum score to (signal, color_emoji).
 
+    PURE momentum signal — no portfolio context. Used by /deep and
+    /monthly where there is no entry price or stop loss to overlay.
+
     Thresholds (per spec):
-      ≥80 STRONG BUY 🟢   ≥65 BUY 🟢   ≥50 HOLD 🟡
+      ≥80 STRONG BUY 🟢   ≥65 BUY 🟢   ≥50 HOLD 🟢
       ≥35 WATCH 🟡        else SELL 🔴
     A None score (insufficient data) renders as WATCH 🟡 — never trips a
     forced sell on a single bad data fetch.
@@ -1211,15 +1214,61 @@ def get_momentum_signal(score):
     if score >= 65:
         return "BUY", "🟢"
     if score >= 50:
-        return "HOLD", "🟡"
+        return "HOLD", "🟢"
     if score >= 35:
         return "WATCH", "🟡"
     return "SELL", "🔴"
 
 
-def _fallback_reason(signal, score):
+def apply_position_rules(score, current_price, entry_price):
+    """Final SELL/HOLD/BUY rules for an OWNED position.
+
+    Per spec — SELL fires if EITHER trigger hits, otherwise the score
+    drives the bucket:
+
+      SELL 🔴       if score < 35  OR  current ≤ entry × (1 + STOP/100)
+      STRONG BUY 🟢 if score ≥ 80  AND price above stop loss
+      BUY 🟢        if score ≥ 65  AND price above stop loss
+      HOLD 🟢       if score ≥ 50  AND price above stop loss
+      WATCH 🟡      otherwise (score 35-50, price above stop loss)
+
+    Returns ``(signal, color, stop_breached)`` so the caller can show
+    WHICH trigger fired.
+    """
+    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)
+    stop_breached = (
+        current_price is not None
+        and entry_price is not None
+        and current_price <= entry_price * stop_factor
+    )
+
+    # Hard SELL rules — either condition trips it.
+    if stop_breached:
+        return "SELL", "🔴", True
+    if score is not None and score < 35:
+        return "SELL", "🔴", False
+
+    # Score-based bucket for everything above the SELL line. None →
+    # WATCH so a single bad data fetch never forces action.
+    if score is None:
+        return "WATCH", "🟡", False
+    if score >= 80:
+        return "STRONG BUY", "🟢", False
+    if score >= 65:
+        return "BUY", "🟢", False
+    if score >= 50:
+        return "HOLD", "🟢", False
+    return "WATCH", "🟡", False
+
+
+def _fallback_reason(signal, score, stop_breached=False):
     """Deterministic one-liner used when Claude is unavailable."""
     if signal == "SELL":
+        if stop_breached:
+            return (
+                "Stop loss breached (-7% from entry) — exit position to "
+                "protect capital."
+            )
         return "Momentum broken across price, RS, and news — exit position."
     if signal == "WATCH":
         return "Momentum weakening — tighten stop, watch for further breakdown."
@@ -1237,6 +1286,12 @@ def _format_momentum_for_prompt(records):
     lines = []
     for r in records:
         d = r.get("details") or {}
+        extras = []
+        if r.get("stop_breached"):
+            extras.append("STOP-LOSS BREACHED (-7%)")
+        if r.get("above_target"):
+            extras.append("ABOVE ANALYST TARGET (overextended)")
+        extras_str = (" | " + " | ".join(extras)) if extras else ""
         lines.append(
             f"- {r['ticker']}: signal={r['signal']}, "
             f"score={r.get('score', 'n/a')}/100, "
@@ -1247,6 +1302,7 @@ def _format_momentum_for_prompt(records):
             f"news={d.get('news', 'n/a')}, "
             f"earnBeat={d.get('earnings_beat')}, "
             f"estRising={d.get('estimates_rising')}"
+            f"{extras_str}"
         )
     return "\n".join(lines)
 
@@ -1260,7 +1316,10 @@ def _get_quick_reasons(positions_data):
     /portfolio always renders.
     """
     fallback = {
-        p["ticker"]: _fallback_reason(p["signal"], p.get("score"))
+        p["ticker"]: _fallback_reason(
+            p["signal"], p.get("score"),
+            stop_breached=p.get("stop_breached", False),
+        )
         for p in positions_data
     }
     if not ANTHROPIC_API_KEY or not positions_data:
@@ -1273,8 +1332,14 @@ def _get_quick_reasons(positions_data):
         "volume ratio, news sentiment, earnings momentum). Write ONE "
         "short sentence (max 16 words) per ticker explaining why the "
         "given signal is appropriate, citing the SPECIFIC weakest or "
-        "strongest momentum component for that ticker. End each sentence "
-        "with a period.\n\n"
+        "strongest momentum component for that ticker.\n\n"
+        "IMPORTANT — when a ticker has the flag 'STOP-LOSS BREACHED', "
+        "the SELL signal is driven by the -7% stop being hit (capital "
+        "protection), NOT by momentum — your sentence MUST mention the "
+        "stop loss being breached. When a ticker has the flag 'ABOVE "
+        "ANALYST TARGET', mention that the stock looks overextended "
+        "even if momentum is still strong.\n\n"
+        "End each sentence with a period.\n\n"
         "Positions:\n" + _format_momentum_for_prompt(positions_data) + "\n\n"
         "Output STRICTLY valid JSON only (no markdown, no preamble, no "
         "trailing text). Schema:\n"
@@ -2378,7 +2443,21 @@ def handle_portfolio(chat_id, scheduled=False):
         score_details = momentum_map.get(ticker)
         score = score_details[0] if score_details else None
         details = score_details[1] if score_details else {}
-        signal, color = get_momentum_signal(score)
+
+        # NEW: portfolio-position rule overlay — SELL if score<35 OR
+        # current price ≤ entry × (1 + STOP_LOSS_PCT/100). This is
+        # different from the pure momentum signal used by /deep & /monthly.
+        signal, color, stop_breached = apply_position_rules(
+            score, current, entry,
+        )
+
+        # BONUS context flag (display-only, not a trigger): price has
+        # already exceeded the analyst target — stock may be overextended.
+        above_target = (
+            current is not None
+            and target is not None
+            and current > target
+        )
 
         # Persist the freshly-computed score so tomorrow's scheduled run
         # can compare against today's value.
@@ -2394,6 +2473,8 @@ def handle_portfolio(chat_id, scheduled=False):
                 "signal": signal, "color": color,
                 "score": score, "prev_score": prev_score,
                 "details": details, "reason": None,
+                "stop_breached": stop_breached,
+                "above_target": above_target,
             })
             continue
 
@@ -2406,6 +2487,8 @@ def handle_portfolio(chat_id, scheduled=False):
             "signal": signal, "color": color,
             "score": score, "prev_score": prev_score,
             "details": details, "reason": None,
+            "stop_breached": stop_breached,
+            "above_target": above_target,
         })
 
     if portfolio_dirty:
@@ -2416,17 +2499,38 @@ def handle_portfolio(chat_id, scheduled=False):
     reasons = _get_quick_reasons(judged)
     for r in records:
         r["reason"] = reasons.get(
-            r["ticker"], _fallback_reason(r["signal"], r.get("score"))
+            r["ticker"],
+            _fallback_reason(
+                r["signal"], r.get("score"),
+                stop_breached=r.get("stop_breached", False),
+            ),
         )
 
     # ── Scheduled-only urgent alerts (sent BEFORE the main report) ─────
     if scheduled:
         for r in records:
-            if r["score"] is not None and r["score"] < 35:
+            # SELL alert fires whenever the rule overlay says SELL —
+            # whether the trigger was momentum < 35 OR the -7% stop
+            # being breached.
+            if r["signal"] == "SELL":
+                if r.get("stop_breached"):
+                    pl_pct_txt = (
+                        f"{r['pl_pct']:+.1f}%" if r.get("pl_pct") is not None
+                        else "n/a"
+                    )
+                    trigger = (
+                        f"Stop loss breached — current "
+                        f"${r['current']:.2f} ≤ stop ${r['stop']:.2f} "
+                        f"(P&L {pl_pct_txt} from entry ${r['entry']:.2f})."
+                    )
+                else:
+                    trigger = (
+                        f"Momentum score collapsed to {r['score']}/100 "
+                        f"(< 35 SELL threshold)."
+                    )
                 send_telegram(
                     f"🚨 SELL ALERT — {r['ticker']}\n"
-                    f"Momentum score collapsed to {r['score']}/100 "
-                    f"(SELL threshold).\n"
+                    f"{trigger}\n"
                     f"Reason: {r['reason']}",
                     chat_id,
                     parse_mode=None,
@@ -2472,12 +2576,32 @@ def handle_portfolio(chat_id, scheduled=False):
 
         if r["target"] is not None:
             upside_pct = ((r["target"] - r["current"]) / r["current"]) * 100
-            target_str = (
-                f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside) | "
-                f"Stop: ${r['stop']:.2f}"
-            )
+            if r.get("above_target"):
+                # Bonus context flag (display-only — not a sell trigger):
+                # the position is trading ABOVE the analyst consensus
+                # target, which historically means it's overextended.
+                target_str = (
+                    f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside, "
+                    f"⚠️ above target — may be overextended) | "
+                    f"Stop: ${r['stop']:.2f}"
+                )
+            else:
+                target_str = (
+                    f"Target: ${r['target']:.0f} ({upside_pct:+.0f}% upside) | "
+                    f"Stop: ${r['stop']:.2f}"
+                )
         else:
             target_str = f"Target: n/a | Stop: ${r['stop']:.2f}"
+
+        # If SELL was triggered by the -7% stop loss (not by momentum
+        # alone), surface the trigger as a dedicated line so it can't be
+        # missed in the per-position breakdown.
+        trigger_line = ""
+        if r.get("stop_breached"):
+            trigger_line = (
+                f"⛔ STOP LOSS BREACHED — current ${r['current']:.2f} "
+                f"≤ stop ${r['stop']:.2f} (-7% from entry)\n"
+            )
 
         # Spec format: full momentum breakdown then position math then reason.
         send_telegram(
@@ -2493,6 +2617,7 @@ def handle_portfolio(chat_id, scheduled=False):
             f"News: {d.get('news', 'n/a')}\n"
             f"Earnings: "
             f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
+            f"{trigger_line}"
             f"{pl_line}\n"
             f"{target_str}\n"
             f"{r['reason']}",

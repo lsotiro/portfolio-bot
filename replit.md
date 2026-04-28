@@ -43,13 +43,31 @@ Every buy/sell signal is now driven by a **100-point momentum score** computed b
 
 Earnings data uses `Ticker.earnings_dates` (yfinance's modern API; `quarterly_earnings` is fully deprecated). Newest-reported quarter only — future dates with NaN "Reported EPS" are filtered out before picking `iloc[0]`.
 
-Score → signal:
-- **≥80 STRONG BUY 🟢** / **≥65 BUY 🟢** / **≥50 HOLD 🟡** / **≥35 WATCH 🟡** / **<35 SELL 🔴**
-- Score `None` (insufficient history) → WATCH 🟡 (never trips a forced sell on a single bad fetch).
+### Position rules (`apply_position_rules`)
+For OWNED positions, `/portfolio` overlays the **stop loss** on top of the
+momentum score so SELL fires on EITHER trigger:
 
-### Trade rules (legacy rails — still used as guard rails)
-- `STOP_LOSS_PCT = -7.0` — stop-loss line shown alongside every position; the feedback-loop uses it to mark a rec STOPPED if breached intraday.
-- Analyst targets fetched from yfinance `targetMeanPrice` on `/buy` and refreshed monthly. Shown as the upside line; no longer drives a forced sell.
+| Condition                                          | Signal        |
+|----------------------------------------------------|---------------|
+| Score < 35  **OR**  current ≤ entry × (1 + STOP_LOSS_PCT/100) | **SELL 🔴** |
+| Score ≥ 80  AND  price above stop                  | STRONG BUY 🟢 |
+| Score ≥ 65  AND  price above stop                  | BUY 🟢        |
+| Score ≥ 50  AND  price above stop                  | HOLD 🟢       |
+| Score 35–50 AND  price above stop                  | WATCH 🟡      |
+| Score `None` (insufficient history)                | WATCH 🟡      |
+
+`apply_position_rules(score, current, entry)` returns
+`(signal, color, stop_breached)` so the caller can show WHICH trigger fired.
+
+For `/deep` and `/monthly` (no portfolio context) the **pure**
+`get_momentum_signal(score)` is still used — same thresholds, no stop overlay.
+
+### Bonus context flag (display-only, NOT a sell trigger)
+- When `current > analyst_target`, the position line shows
+  `⚠️ above target — may be overextended` next to the upside %.
+  Claude's per-position reason also calls this out.
+- Stops are rendered but no longer drive a forced sell **above** the
+  stop — only **at or below** triggers SELL via the rule above.
 - Fundamentals (`passes_buy_screen`) are used ONLY as a hard filter at the top of `/monthly` — they no longer drive any individual buy/sell signal.
 
 ### Earnings calendar (Alpha Vantage + yfinance)
@@ -165,9 +183,15 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 - **Persistence**: every position's freshly computed `momentum_score` is
   written back to `portfolio.json`. The next scheduled run reads the
   prior score to detect day-over-day drops > 20pts (warning trigger).
+- **Stop-loss trigger line** — when `apply_position_rules` flags
+  `stop_breached`, the per-position message includes a dedicated
+  `⛔ STOP LOSS BREACHED — current $X ≤ stop $Y (-7% from entry)` line
+  ABOVE the P&L line so the trigger can't be missed.
 - **Scheduled-only urgent alerts** (`scheduled=True` from `scheduled_run`):
-  - 🚨 SELL ALERT — sent immediately for any position that crossed below
-    score 35 since the last run.
+  - 🚨 SELL ALERT — sent immediately for any position whose final signal
+    is SELL. Two distinct alert texts based on which trigger fired:
+    - Stop-loss breach → `Stop loss breached — current $X ≤ stop $Y (P&L -X% from entry)`
+    - Momentum < 35    → `Momentum score collapsed to X/100 (< 35 SELL threshold)`
   - ⚠️ WARNING — sent for any position whose score dropped > 20 pts vs
     yesterday (catches sudden momentum collapses BEFORE they hit the SELL
     threshold).
