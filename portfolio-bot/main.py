@@ -3,6 +3,8 @@ import anthropic
 import requests
 import os
 import urllib.request
+import time
+import schedule
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -101,3 +103,9 @@ def run():
     print("Sent to Telegram!")
 
 run()
+
+schedule.every().day.at("09:00", "UTC").do(run)
+print("Scheduler started. Next run at 09:00 UTC daily. Press Ctrl+C to stop.")
+while True:
+    schedule.run_pending()
+    time.sleep(30)
