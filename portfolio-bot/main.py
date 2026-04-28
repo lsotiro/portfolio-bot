@@ -10,8 +10,9 @@ Commands you can send the bot:
 Once a day at 09:00 UTC the bot also runs /analyze automatically.
 
 Hard rules applied to every holding before Claude is consulted:
-  - Stop loss : sell if down 8% or more from entry
-  - Take profit: sell if up 20% or more from entry
+  - Stop loss   : forced SELL if down 7% or more from entry
+  - Partial TP  : alert at +15% (consider selling 50%)
+  - Full TP     : forced SELL alert at +25% (consider exiting fully)
 """
 
 import json
@@ -29,14 +30,17 @@ import yfinance as yf
 from flask import Flask
 
 # Hard trade rules (always override fundamentals)
-STOP_LOSS_PCT = -8.0
-TAKE_PROFIT_PCT = 20.0
+STOP_LOSS_PCT = -7.0       # forced SELL at -7%
+PARTIAL_PROFIT_PCT = 15.0  # alert only — suggest selling 50%
+TAKE_PROFIT_PCT = 25.0     # forced SELL at +25%
 
-# Buy-screen filters
-SCREEN_MIN_REVENUE_GROWTH = 0.05    # > 5%
-SCREEN_MAX_RECOMMENDATION = 2.5     # analyst consensus leans buy
-SCREEN_MAX_FORWARD_PE = 40.0
-SCREEN_MIN_PROFIT_MARGIN = 0.0      # actually profitable
+# Buy-screen filters (tighter — quality businesses only)
+SCREEN_MIN_REVENUE_GROWTH = 0.15     # > 15%
+SCREEN_MAX_RECOMMENDATION = 2.0      # strong analyst conviction
+SCREEN_MAX_FORWARD_PE = 25.0         # not expensive
+SCREEN_MIN_PROFIT_MARGIN = 0.15      # 15% minimum
+SCREEN_MIN_ROE = 0.15                # ROE > 15%
+SCREEN_MIN_EARNINGS_GROWTH = 0.10    # > 10%
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -184,18 +188,22 @@ def fetch_fundamentals_bulk(tickers, max_workers=10):
 
 
 def passes_buy_screen(f):
-    """Apply the four hard fundamental filters."""
+    """Apply the six hard fundamental filters."""
     rg = f.get("revenueGrowth")
     rm = f.get("recommendationMean")
     fpe = f.get("forwardPE")
     pm = f.get("profitMargins")
-    if rg is None or rm is None or fpe is None or pm is None:
+    roe = f.get("returnOnEquity")
+    eg = f.get("earningsGrowth")
+    if any(v is None for v in (rg, rm, fpe, pm, roe, eg)):
         return False
     return (
         rg > SCREEN_MIN_REVENUE_GROWTH
         and rm < SCREEN_MAX_RECOMMENDATION
         and fpe < SCREEN_MAX_FORWARD_PE
         and pm > SCREEN_MIN_PROFIT_MARGIN
+        and roe > SCREEN_MIN_ROE
+        and eg > SCREEN_MIN_EARNINGS_GROWTH
     )
 
 
@@ -322,8 +330,9 @@ def pick_monthly_buys_with_claude(candidates):
 
     prompt = f"""You are a senior equity analyst running a monthly buy screen.
 
-The candidates below have ALREADY passed a hard fundamentals filter
-(revenue growth > 5%, analyst rec < 2.5, forward PE < 40, profit margin > 0).
+The candidates below have ALREADY passed a strict fundamentals filter:
+revenue growth > 15%, earnings growth > 10%, profit margin > 15%,
+ROE > 15%, forward PE < 25, analyst recommendationMean < 2.0.
 
 CANDIDATES:
 {candidates_text}
@@ -392,6 +401,9 @@ def run_analysis(chat_id):
 
     judged_positions = []
     forced_lines = []
+    alert_lines = []  # soft alerts (e.g. partial take profit)
+    portfolio_dirty = False  # set True if alert state changes & needs saving
+
     for ticker, pos in portfolio.items():
         f = fundamentals.get(ticker)
         # Prefer the live price embedded in fundamentals; fall back otherwise.
@@ -403,17 +415,53 @@ def run_analysis(chat_id):
             ((current - pos["entry_price"]) / pos["entry_price"]) * 100, 2
         )
 
+        # Per-position alert state (default to not-yet-fired)
+        partial_alerted = pos.get("partial_alerted", False)
+        full_alerted = pos.get("full_alerted", False)
+
         forced_signal = None
         forced_reason = None
+
+        # --- Hard stop loss ---
         if pl_pct <= STOP_LOSS_PCT:
             forced_signal = "SELL"
             forced_reason = (
                 f"hard stop loss hit (P/L {pl_pct}% ≤ {STOP_LOSS_PCT}%)"
             )
+
+        # --- Full take profit at +25% (forced SELL + alert once) ---
         elif pl_pct >= TAKE_PROFIT_PCT:
             forced_signal = "SELL"
             forced_reason = (
-                f"hard take profit hit (P/L {pl_pct}% ≥ {TAKE_PROFIT_PCT}%)"
+                f"FULL SELL — take profit target hit "
+                f"(P/L {pl_pct}% ≥ {TAKE_PROFIT_PCT}%)"
+            )
+            if not full_alerted:
+                alert_msg = (
+                    f"🚨 *{ticker}* FULL SELL — take profit target hit "
+                    f"({pl_pct}% ≥ {TAKE_PROFIT_PCT}%). "
+                    f"Consider exiting full position."
+                )
+                send_telegram(alert_msg, chat_id)
+                pos["full_alerted"] = True
+                # Treat partial as also resolved so we don't re-fire it
+                pos["partial_alerted"] = True
+                portfolio_dirty = True
+
+        # --- Partial take profit at +15% (alert once, no forced SELL) ---
+        elif pl_pct >= PARTIAL_PROFIT_PCT:
+            if not partial_alerted:
+                alert_msg = (
+                    f"⚠️ *{ticker}* PARTIAL SELL — consider selling 50% "
+                    f"of position to lock gains "
+                    f"({pl_pct}% ≥ {PARTIAL_PROFIT_PCT}%)."
+                )
+                send_telegram(alert_msg, chat_id)
+                pos["partial_alerted"] = True
+                portfolio_dirty = True
+            alert_lines.append(
+                f"{ticker} — PARTIAL SELL alert — P/L {pl_pct}% "
+                f"crossed +{PARTIAL_PROFIT_PCT}% (consider trimming 50%)"
             )
 
         judged_positions.append(
@@ -433,6 +481,10 @@ def run_analysis(chat_id):
                 f"{ticker} — {forced_signal} — {forced_reason}"
             )
 
+    # Persist any newly-fired alert flags so we don't double-alert next time.
+    if portfolio_dirty:
+        save_portfolio(portfolio)
+
     if not judged_positions:
         send_telegram(
             "Could not fetch current prices for any of your holdings.",
@@ -451,6 +503,10 @@ def run_analysis(chat_id):
     if forced_lines:
         sections.append("*Hard-rule SELLs (override fundamentals):*")
         sections.extend(forced_lines)
+        sections.append("")
+    if alert_lines:
+        sections.append("*Partial-take-profit alerts:*")
+        sections.extend(alert_lines)
         sections.append("")
     sections.append(claude_output)
     send_telegram("\n".join(sections), chat_id)
@@ -601,7 +657,8 @@ def handle_start(chat_id):
         "`/portfolio` — show holdings with live P&L\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
-        "_Hard rules: SELL at -8% stop loss or +20% take profit._",
+        "_Hard rules: forced SELL at -7% stop loss or +25% take profit._\n"
+        "_Soft alert: PARTIAL SELL (50%) at +15%._",
         chat_id,
     )
 
@@ -692,12 +749,13 @@ schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 
 
 # ---------------------------------------------------------------------------
-# Boot everything
+# Boot everything (only when run as a script, NOT when imported)
 # ---------------------------------------------------------------------------
-Thread(target=keep_alive, daemon=True).start()
-Thread(target=poll_telegram, daemon=True).start()
+if __name__ == "__main__":
+    Thread(target=keep_alive, daemon=True).start()
+    Thread(target=poll_telegram, daemon=True).start()
 
-print("Portfolio Bot started. Daily analysis scheduled at 09:00 UTC.")
-while True:
-    schedule.run_pending()
-    time.sleep(30)
+    print("Portfolio Bot started. Daily analysis scheduled at 09:00 UTC.")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)

@@ -22,6 +22,7 @@
   "NVDA": {
     "shares": 3.0,
     "entry_price": 174.92,
-    "added": "2026-04-28T14:50:54"
+    "added": "2026-04-28T14:50:54",
+    "partial_alerted": true
   }
 }
