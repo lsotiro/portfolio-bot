@@ -2,32 +2,50 @@
   "CRM": {
     "shares": 2.0,
     "entry_price": 263.42,
-    "added": "2026-04-28T14:39:58"
+    "added": "2026-04-28T14:39:58",
+    "analyst_target": 268.8725,
+    "approach_alerted": false,
+    "above_alerted": false
   },
   "ADSK": {
     "shares": 2.0,
     "entry_price": 305.93,
-    "added": "2026-04-28T14:42:22"
+    "added": "2026-04-28T14:42:22",
+    "analyst_target": 325.54843,
+    "approach_alerted": false,
+    "above_alerted": false
   },
   "NIO": {
     "shares": 38.0,
     "entry_price": 7.9,
-    "added": "2026-04-28T14:49:27"
+    "added": "2026-04-28T14:49:27",
+    "analyst_target": 6.661333,
+    "approach_alerted": false,
+    "above_alerted": false
   },
   "NVDA": {
     "shares": 3.0,
     "entry_price": 174.92,
     "added": "2026-04-28T14:50:54",
-    "partial_alerted": true
+    "partial_alerted": true,
+    "analyst_target": 268.6148,
+    "approach_alerted": false,
+    "above_alerted": false
   },
   "SCHW": {
     "shares": 4.0,
     "entry_price": 90.84,
-    "added": "2026-04-28T15:37:16"
+    "added": "2026-04-28T15:37:16",
+    "analyst_target": 115.2,
+    "approach_alerted": false,
+    "above_alerted": false
   },
   "AVGO": {
     "shares": 2.0,
     "entry_price": 396.28,
-    "added": "2026-04-28T15:37:52"
+    "added": "2026-04-28T15:37:52",
+    "analyst_target": 475.49295,
+    "approach_alerted": false,
+    "above_alerted": false
   }
 }

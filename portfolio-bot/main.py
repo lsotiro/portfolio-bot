@@ -3,7 +3,7 @@
 Commands you can send the bot:
   /buy TICKER SHARES PRICE   add a position (e.g. /buy AAPL 10 189.50)
   /sell TICKER [SHARES]      sell entire position, or only N shares
-  /trim TICKER               sell 50% of a position (the +15% shortcut)
+  /trim TICKER               sell 50% of a position (quick partial exit)
   /portfolio                 show current holdings with live P&L
   /analyze                   run the daily HOLD/SELL review on holdings
   /monthly                   run the monthly S&P 500 buy screen
@@ -11,12 +11,16 @@ Commands you can send the bot:
 Once a day at 09:00 UTC the bot also runs /analyze automatically.
 
 Hard rules applied to every holding before Claude is consulted:
-  - Stop loss   : forced SELL if down 7% or more from entry (capital protection)
-  - Full TP     : forced SELL alert at +25% (consider exiting fully)
-  - Fair value  : forced SELL when price ≥ 90% of analyst consensus target
-                  (close to fair value — limited remaining upside)
-  - Partial TP  : alert at +15% (consider selling 50%)
-HOLD remains the default whenever none of these trigger and Claude agrees.
+  - Stop loss        : forced SELL if down 7% from entry (capital protection)
+  - Above fair value : forced SELL when price ≥ analyst consensus target
+                       (strong sell signal)
+  - Approaching FV   : soft alert when price ≥ 90% of analyst target
+                       (consider selling — limited remaining upside)
+  - Big upside       : info line when price ≤ 70% of analyst target
+                       (significant remaining upside)
+Take-profit is now driven entirely by the analyst consensus target stored
+on each position — there is no flat % target. Targets are fetched when a
+position is added and refreshed on the 1st of every month.
 """
 
 import json
@@ -34,10 +38,27 @@ import yfinance as yf
 from flask import Flask
 
 # Hard trade rules (always override fundamentals)
-STOP_LOSS_PCT = -7.0          # forced SELL at -7% (capital protection)
-PARTIAL_PROFIT_PCT = 15.0     # alert only — suggest selling 50%
-TAKE_PROFIT_PCT = 25.0        # forced SELL at +25%
-NEAR_TARGET_FRACTION = 0.90   # forced SELL when price ≥ 90% of analyst target
+STOP_LOSS_PCT = -7.0              # forced SELL at -7% (capital protection)
+ABOVE_TARGET_FRACTION = 1.00      # forced SELL when price ≥ analyst target
+APPROACH_TARGET_FRACTION = 0.90   # soft alert when price ≥ 90% of target
+LOW_TARGET_FRACTION = 0.70        # info: price ≤ 70% of target → big upside
+
+
+def _safe_target(value):
+    """Return value if it is a positive number, else None.
+
+    yfinance occasionally returns 0, NaN, or None for targetMeanPrice on
+    obscure tickers; those values would crash percentage math, so we
+    normalise them to None here and skip target-based rules downstream.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    # Guard against NaN (NaN != NaN) and non-positive values.
+    if v != v or v <= 0:
+        return None
+    return v
 
 # Buy-screen filters (tighter — quality businesses only)
 SCREEN_MIN_REVENUE_GROWTH = 0.15     # > 15%
@@ -548,8 +569,9 @@ def run_analysis(chat_id):
 
     judged_positions = []
     forced_lines = []
-    alert_lines = []  # soft alerts (e.g. partial take profit)
-    portfolio_dirty = False  # set True if alert state changes & needs saving
+    alert_lines = []  # soft alerts (approaching fair value)
+    info_lines = []   # informational (big upside remaining, etc.)
+    portfolio_dirty = False  # set True if state changes & needs saving
 
     for ticker, pos in portfolio.items():
         f = fundamentals.get(ticker)
@@ -562,76 +584,78 @@ def run_analysis(chat_id):
             ((current - pos["entry_price"]) / pos["entry_price"]) * 100, 2
         )
 
-        # Per-position alert state (default to not-yet-fired)
-        partial_alerted = pos.get("partial_alerted", False)
-        full_alerted = pos.get("full_alerted", False)
+        # Resolve the analyst target. Prefer the value stored at /buy time.
+        # If the position pre-dates the new system, lazily fetch and persist.
+        # _safe_target normalises 0/NaN/None to None so the math stays safe.
+        target = _safe_target(pos.get("analyst_target"))
+        if target is None and f:
+            live_target = _safe_target(f.get("targetMeanPrice"))
+            if live_target is not None:
+                target = live_target
+                pos["analyst_target"] = target
+                portfolio_dirty = True
+
+        # Per-position alert state for the target-based system.
+        approach_alerted = pos.get("approach_alerted", False)
+        above_alerted = pos.get("above_alerted", False)
 
         forced_signal = None
         forced_reason = None
 
-        # --- Hard stop loss ---
+        # --- Hard stop loss (capital protection — always wins) ---
         if pl_pct <= STOP_LOSS_PCT:
             forced_signal = "SELL"
             forced_reason = (
                 f"hard stop loss hit (P/L {pl_pct}% ≤ {STOP_LOSS_PCT}%)"
             )
 
-        # --- Full take profit at +25% (forced SELL + alert once) ---
-        elif pl_pct >= TAKE_PROFIT_PCT:
-            forced_signal = "SELL"
-            forced_reason = (
-                f"FULL SELL — take profit target hit "
-                f"(P/L {pl_pct}% ≥ {TAKE_PROFIT_PCT}%)"
-            )
-            if not full_alerted:
-                alert_msg = (
-                    f"🚨 *{ticker}* FULL SELL — take profit target hit "
-                    f"({pl_pct}% ≥ {TAKE_PROFIT_PCT}%). "
-                    f"Consider exiting full position."
-                )
-                send_telegram(alert_msg, chat_id)
-                pos["full_alerted"] = True
-                # Treat partial as also resolved so we don't re-fire it
-                pos["partial_alerted"] = True
-                portfolio_dirty = True
-
-        # --- Near analyst fair value (price ≥ 90% of consensus target) ---
-        # Only fires when fundamentals provide a target. HOLD if still far below.
-        elif (
-            f
-            and f.get("targetMeanPrice")
-            and current >= NEAR_TARGET_FRACTION * f["targetMeanPrice"]
-        ):
-            target = f["targetMeanPrice"]
+        # --- Above analyst fair value (forced SELL + strong alert) ---
+        elif target is not None and current >= ABOVE_TARGET_FRACTION * target:
             pct_of_target = (current / target) * 100
             forced_signal = "SELL"
             forced_reason = (
-                f"near analyst fair value "
-                f"(${current:.2f} ≥ {NEAR_TARGET_FRACTION:.0%} of "
-                f"${target:.2f} target — {pct_of_target:.0f}% of target)"
+                f"ABOVE FAIR VALUE — strong sell signal "
+                f"(${current:.2f} ≥ ${target:.2f} target — "
+                f"{pct_of_target:.0f}% of target)"
             )
-            # Soft alert (don't gate on partial/full flags — this is its own rule)
-            send_telegram(
-                f"⚠️ *{ticker}* near fair value — price ${current:.2f} is "
-                f"{pct_of_target:.0f}% of analyst target ${target:.2f}. "
-                f"Consider selling — limited remaining upside.",
-                chat_id,
-            )
-
-        # --- Partial take profit at +15% (alert once, no forced SELL) ---
-        elif pl_pct >= PARTIAL_PROFIT_PCT:
-            if not partial_alerted:
-                alert_msg = (
-                    f"⚠️ *{ticker}* PARTIAL SELL — consider selling 50% "
-                    f"of position to lock gains "
-                    f"({pl_pct}% ≥ {PARTIAL_PROFIT_PCT}%)."
+            if not above_alerted:
+                send_telegram(
+                    f"🚨 *{ticker}* ABOVE FAIR VALUE — strong sell signal. "
+                    f"Price ${current:.2f} is now "
+                    f"{pct_of_target:.0f}% of analyst target ${target:.2f}.",
+                    chat_id,
                 )
-                send_telegram(alert_msg, chat_id)
-                pos["partial_alerted"] = True
+                pos["above_alerted"] = True
+                # If we're above fair value we're also past the approach line.
+                pos["approach_alerted"] = True
+                portfolio_dirty = True
+
+        # --- Approaching fair value (soft alert, not a forced SELL) ---
+        elif target is not None and current >= APPROACH_TARGET_FRACTION * target:
+            pct_of_target = (current / target) * 100
+            if not approach_alerted:
+                send_telegram(
+                    f"⚠️ *{ticker}* APPROACHING FAIR VALUE — consider selling. "
+                    f"Price ${current:.2f} is {pct_of_target:.0f}% of "
+                    f"analyst target ${target:.2f}.",
+                    chat_id,
+                )
+                pos["approach_alerted"] = True
                 portfolio_dirty = True
             alert_lines.append(
-                f"{ticker} — PARTIAL SELL alert — P/L {pl_pct}% "
-                f"crossed +{PARTIAL_PROFIT_PCT}% (consider trimming 50%)"
+                f"{ticker} — APPROACHING FAIR VALUE — ${current:.2f} is "
+                f"{pct_of_target:.0f}% of ${target:.2f} target "
+                f"(consider selling)"
+            )
+
+        # --- Big upside remaining (info only, no alert) ---
+        elif target is not None and current <= LOW_TARGET_FRACTION * target:
+            upside_dollar = target - current
+            upside_pct = ((target - current) / current) * 100
+            info_lines.append(
+                f"{ticker} — UPSIDE — +${upside_dollar:.2f}/share "
+                f"({upside_pct:+.0f}%) remaining to analyst target "
+                f"${target:.2f} (current ${current:.2f})"
             )
 
         judged_positions.append(
@@ -640,6 +664,7 @@ def run_analysis(chat_id):
                 "shares": pos["shares"],
                 "entry_price": pos["entry_price"],
                 "current_price": current,
+                "analyst_target": target,
                 "pl_pct": pl_pct,
                 "fundamentals": f,
                 "forced_signal": forced_signal,
@@ -651,7 +676,7 @@ def run_analysis(chat_id):
                 f"{ticker} — {forced_signal} — {forced_reason}"
             )
 
-    # Persist any newly-fired alert flags so we don't double-alert next time.
+    # Persist any newly-fired alert flags or lazy-fetched targets.
     if portfolio_dirty:
         save_portfolio(portfolio)
 
@@ -691,8 +716,12 @@ def run_analysis(chat_id):
         sections.extend(forced_lines)
         sections.append("")
     if alert_lines:
-        sections.append("*Partial-take-profit alerts:*")
+        sections.append("*Approaching fair value:*")
         sections.extend(alert_lines)
+        sections.append("")
+    if info_lines:
+        sections.append("*Upside remaining (well below fair value):*")
+        sections.extend(info_lines)
         sections.append("")
     sections.append(claude_output)
     send_telegram("\n".join(sections), chat_id)
@@ -762,14 +791,35 @@ def handle_buy(args, chat_id):
         )
         return
 
+    # Fetch the analyst consensus target right at buy time and store it.
+    fund = get_fundamentals(ticker)
+    target = _safe_target((fund or {}).get("targetMeanPrice"))
+
     portfolio = load_portfolio()
     portfolio[ticker] = {
         "shares": shares,
         "entry_price": price,
         "added": datetime.utcnow().isoformat(timespec="seconds"),
+        "analyst_target": target,
+        # alert state for the new target-based system
+        "approach_alerted": False,
+        "above_alerted": False,
     }
     save_portfolio(portfolio)
-    send_telegram(f"Added *{ticker}* — {shares} shares @ ${price}", chat_id)
+
+    if target:
+        upside = ((target - price) / price) * 100
+        send_telegram(
+            f"Added *{ticker}* — {shares} shares @ ${price:.2f}\n"
+            f"Analyst target: ${target:.2f} ({upside:+.1f}% upside)",
+            chat_id,
+        )
+    else:
+        send_telegram(
+            f"Added *{ticker}* — {shares} shares @ ${price:.2f}\n"
+            f"_Analyst target unavailable._",
+            chat_id,
+        )
 
 
 def handle_sell(args, chat_id):
@@ -837,11 +887,11 @@ def handle_sell(args, chat_id):
 
 
 def handle_trim(args, chat_id):
-    # /trim AAPL  -> sells 50% of the AAPL position (matches +15% partial alert)
+    # /trim AAPL  -> sells 50% of the AAPL position (quick partial exit)
     if not args:
         send_telegram(
             "Usage: /trim TICKER\n"
-            "Sells 50% of your position (the +15% partial-take-profit shortcut).",
+            "Sells 50% of your position (quick partial exit).",
             chat_id,
         )
         return
@@ -898,18 +948,32 @@ def handle_portfolio(chat_id):
     total_cost = 0.0
     total_value = 0.0
 
-    # Pre-compute the trigger prices from the global rule constants.
-    # stop loss is negative (e.g. -7) so divide by 100 and add to 1.0
-    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)        # e.g. 0.93
-    partial_factor = 1.0 + (PARTIAL_PROFIT_PCT / 100.0)  # e.g. 1.15
+    # Stop loss is negative (e.g. -7) — convert to a price multiplier.
+    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)  # e.g. 0.93
+
+    # Bulk-fetch current prices + analyst targets in one shot. Lazily fill
+    # any missing analyst_target on existing positions while we're at it.
+    tickers = list(portfolio.keys())
+    fundamentals = fetch_fundamentals_bulk(tickers)
+    portfolio_dirty = False
 
     for ticker, pos in portfolio.items():
         shares = pos["shares"]
         entry = pos["entry_price"]
-        current = get_current_price(ticker)
+        f = fundamentals.get(ticker)
+        current = (f or {}).get("currentPrice") or get_current_price(ticker)
+
+        # Resolve analyst target: stored value wins, else live fetch & persist.
+        # _safe_target normalises 0/NaN/None so display & math stay consistent.
+        target = _safe_target(pos.get("analyst_target"))
+        if target is None and f:
+            live_target = _safe_target(f.get("targetMeanPrice"))
+            if live_target is not None:
+                target = live_target
+                pos["analyst_target"] = target
+                portfolio_dirty = True
 
         stop_price = entry * stop_factor
-        partial_price = entry * partial_factor
 
         # First line: ticker, shares, entry price
         lines.append(f"*{ticker}* — {shares} shares @ ${entry:.2f}")
@@ -918,42 +982,66 @@ def handle_portfolio(chat_id):
             lines.append("Current: _price unavailable_")
             lines.append(
                 f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) | "
-                f"+15% trim @ ${partial_price:.2f}"
+                f"Target: "
+                + (f"${target:.2f}" if target else "_unavailable_")
+            )
+            lines.append("")
+            continue
+
+        pl_dollar = (current - entry) * shares
+        pl_pct = ((current - entry) / entry) * 100
+        pl_emoji = "🟢" if pl_dollar >= 0 else "🔴"
+        pl_sign = "+" if pl_dollar >= 0 else "-"
+
+        # Line 2: Current vs Entry, P&L
+        lines.append(
+            f"Entry ${entry:.2f} → Current ${current:.2f} | "
+            f"P&L: {pl_sign}${abs(pl_dollar):.2f} "
+            f"({pl_sign}{abs(pl_pct):.1f}%) {pl_emoji}"
+        )
+
+        # Line 3: Analyst target + % upside remaining (or "above target")
+        if target:
+            upside_pct = ((target - current) / current) * 100
+            if upside_pct >= 0:
+                target_label = (
+                    f"Target ${target:.2f} | "
+                    f"Upside: +{upside_pct:.1f}% "
+                    f"(${target - current:+.2f}/share)"
+                )
+            else:
+                # Above the analyst target — show how far past
+                pct_of_target = (current / target) * 100
+                target_label = (
+                    f"Target ${target:.2f} | "
+                    f"*Above target* — {pct_of_target:.0f}% of target "
+                    f"(${current - target:+.2f}/share over)"
+                )
+        else:
+            target_label = "Target _unavailable_"
+
+        lines.append(target_label)
+
+        # Line 4: stop loss price + distance
+        dist_to_stop = current - stop_price
+        if dist_to_stop >= 0:
+            stop_label = (
+                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) → "
+                f"${dist_to_stop:.2f}/share above stop"
             )
         else:
-            pl_dollar = (current - entry) * shares
-            pl_pct = ((current - entry) / entry) * 100
-            emoji = "🟢" if pl_dollar >= 0 else "🔴"
-            sign = "+" if pl_dollar >= 0 else "-"
-
-            # Per-share dollar distance to each trigger
-            dist_to_stop = current - stop_price          # >0 above stop
-            dist_to_partial = partial_price - current    # >0 below TP
-
             stop_label = (
-                f"${dist_to_stop:.2f} above stop"
-                if dist_to_stop >= 0
-                else f"${abs(dist_to_stop):.2f} *below* stop"
+                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) → "
+                f"*${abs(dist_to_stop):.2f}/share BELOW stop*"
             )
-            tp_label = (
-                f"${dist_to_partial:.2f} to +15%"
-                if dist_to_partial >= 0
-                else f"+15% hit (${abs(dist_to_partial):.2f} past)"
-            )
+        lines.append(stop_label)
 
-            lines.append(
-                f"Current: ${current:.2f} | "
-                f"P&L: {sign}${abs(pl_dollar):.2f} "
-                f"({sign}{abs(pl_pct):.1f}%) {emoji}"
-            )
-            lines.append(
-                f"Stop @ ${stop_price:.2f} → {stop_label} | "
-                f"+15% TP @ ${partial_price:.2f} → {tp_label}"
-            )
-            total_cost += entry * shares
-            total_value += current * shares
-
+        total_cost += entry * shares
+        total_value += current * shares
         lines.append("")  # blank line between positions
+
+    if portfolio_dirty:
+        save_portfolio(portfolio)
 
     if total_cost > 0:
         total_pl = total_value - total_cost
@@ -976,15 +1064,16 @@ def handle_start(chat_id):
         "Commands:\n"
         "`/buy TICKER SHARES PRICE` — add a position\n"
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
-        "`/trim TICKER` — sell 50% of a position (the +15% shortcut)\n"
-        "`/portfolio` — holdings with live P&L + stop/TP distances\n"
+        "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
+        "`/portfolio` — holdings with live P&L, analyst target & upside\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
         "_Hard SELL rules:_\n"
         "_• -7% stop loss (capital protection)_\n"
-        "_• +25% full take profit_\n"
-        "_• price ≥ 90% of analyst target (near fair value)_\n"
-        "_Soft alert: PARTIAL SELL (50%) at +15%._",
+        "_• price ≥ analyst target (above fair value — strong sell)_\n"
+        "_Soft alert:_\n"
+        "_• price ≥ 90% of analyst target (approaching fair value)_\n"
+        "_Targets are fetched at /buy and refreshed on the 1st of each month._",
         chat_id,
     )
 
@@ -1063,6 +1152,68 @@ def poll_telegram():
 
 
 # ---------------------------------------------------------------------------
+# Monthly analyst-target refresh
+# ---------------------------------------------------------------------------
+def refresh_analyst_targets(chat_id=None, notify=True):
+    """Re-fetch the analyst consensus target for every holding.
+
+    Stores the new target on each position and resets the per-position
+    alert flags so the new target gets a fresh evaluation. Optionally
+    sends a Telegram summary of which targets changed.
+    """
+    portfolio = load_portfolio()
+    if not portfolio:
+        return
+
+    tickers = list(portfolio.keys())
+    fundamentals = fetch_fundamentals_bulk(tickers)
+    changes = []
+    unchanged = []
+    missing = []
+
+    for ticker, pos in portfolio.items():
+        f = fundamentals.get(ticker)
+        new_target = _safe_target((f or {}).get("targetMeanPrice"))
+        old_target = _safe_target(pos.get("analyst_target"))
+
+        if new_target is None:
+            missing.append(ticker)
+            continue
+
+        # Reset alert flags so the refreshed target re-evaluates from scratch.
+        pos["analyst_target"] = new_target
+        pos["approach_alerted"] = False
+        pos["above_alerted"] = False
+
+        if old_target is None:
+            changes.append(f"{ticker}: set ${new_target:.2f}")
+        elif abs(new_target - old_target) >= 0.01:
+            arrow = "↑" if new_target > old_target else "↓"
+            changes.append(
+                f"{ticker}: ${old_target:.2f} → ${new_target:.2f} {arrow}"
+            )
+        else:
+            unchanged.append(ticker)
+
+    save_portfolio(portfolio)
+
+    if notify and chat_id is not None:
+        body = ["*Monthly analyst-target refresh*", ""]
+        if changes:
+            body.append("*Updated:*")
+            body.extend(changes)
+        else:
+            body.append("_No target changes._")
+        if unchanged:
+            body.append("")
+            body.append(f"_Unchanged:_ {', '.join(unchanged)}")
+        if missing:
+            body.append("")
+            body.append(f"_No target available:_ {', '.join(missing)}")
+        send_telegram("\n".join(body), chat_id)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled daily run at 09:00 UTC
 # ---------------------------------------------------------------------------
 def scheduled_run():
@@ -1070,6 +1221,14 @@ def scheduled_run():
     if chat_id is None:
         print("Skipping scheduled run — no chat has interacted with the bot yet.")
         return
+    # On the 1st of the month, refresh analyst targets BEFORE running
+    # the analysis so the day's review uses the freshest numbers.
+    if datetime.utcnow().day == 1:
+        print("[monthly] refreshing analyst targets")
+        try:
+            refresh_analyst_targets(chat_id=chat_id)
+        except Exception as exc:
+            print(f"[monthly] target refresh failed: {exc}")
     run_analysis(chat_id)
 
 
