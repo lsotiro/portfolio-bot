@@ -88,7 +88,7 @@ def run():
         print("ERROR: Could not get Telegram chat ID. Make sure you sent a message to your bot first!")
         return
     print(f"Telegram chat ID found: {chat_id}")
-    send_telegram("*Portfolio Bot starting analysis...*\nFetching S&P 500 data, this takes ~1 minute.", chat_id)
+    send_telegram("*Portfolio Bot starting analysis...*\nFetching S&P 500 data, this takes about 1 minute.", chat_id)
     tickers = get_sp500_tickers()
     print(f"Got {len(tickers)} tickers")
     stock_data = fetch_stock_data(tickers)
