@@ -1,0 +1,62 @@
+Completely upgrade the stock analysis system in main.py:
+
+1. Create a new function get_rich_fundamentals(ticker) that fetches ALL of these from yfinance:
+   - Basic: currentPrice, targetMeanPrice, targetHighPrice, targetLowPrice, numberOfAnalystOpinions
+   - Valuation: forwardPE, trailingPE, pegRatio, priceToSalesTrailing12Months, priceToBook, enterpriseToEbitda
+   - Growth: revenueGrowth, earningsGrowth, earningsQuarterlyGrowth, revenueQuarterlyGrowth
+   - Margins: grossMargins, operatingMargins, profitMargins (track trend if possible)
+   - Health: debtToEquity, currentRatio, freeCashflow, returnOnEquity, returnOnAssets
+   - Ownership: heldPercentInsiders, heldPercentInstitutions
+   - Analyst: recommendationMean, numberOfAnalystOpinions, targetHighPrice, targetLowPrice
+   - Calculate analyst conviction score: 10 - ((targetHighPrice - targetLowPrice) / targetMeanPrice * 10)
+   - Fetch last 4 quarters earnings history using yf.Ticker(ticker).quarterly_earnings
+   - Calculate if earnings are accelerating or decelerating over last 3 quarters
+
+2. Replace the current basic Claude prompt with this advanced framework prompt:
+
+"You are a senior fundamental equity analyst at a top hedge fund with a short term 1-6 month investment horizon. A client has a $5,000 portfolio and invests $300-500 per position.
+
+Analyze this stock using this exact framework:
+
+BUSINESS QUALITY (score 1-5):
+- Does it have a competitive moat?
+- Is management credible?
+- Is the business model durable?
+
+GROWTH TRAJECTORY (score 1-5):
+- Is revenue/earnings growth accelerating or decelerating?
+- Look at the quarterly trend, not just the annual number
+- Are margins expanding or contracting?
+
+VALUATION (score 1-5):
+- Is the PEG ratio below 2? (growth at reasonable price)
+- How does forward P/E compare to sector average?
+- What is the analyst target conviction? (tight range = high conviction)
+
+CATALYST (score 1-5):
+- What specific event in next 1-6 months could move this stock?
+- Upcoming earnings, product launch, sector rotation, macro?
+
+RISK (score 1-5):
+- What is the single biggest risk to this thesis?
+- Is it company specific or macro?
+
+FINAL RECOMMENDATION:
+- Total score out of 25
+- Signal: STRONG BUY (20-25) / BUY (15-19) / HOLD (10-14) / SELL (below 10)
+- Suggested position size: $500 (strong buy), $300 (buy), $0 (hold/sell)
+- Price target: your own estimate based on fundamentals (not just analyst average)
+- Stop loss: your recommended level based on key support
+- Time horizon: weeks until thesis plays out
+- One paragraph bull case
+- One paragraph bear case"
+
+3. For the monthly screen, run this full analysis only on stocks that pass the hard fundamental filters
+
+4. For existing portfolio holdings in daily monitor, run this analysis for each position and update the HOLD/SELL recommendation
+
+5. Add a /deep TICKER command that runs this full analysis on any single stock on demand and sends the complete breakdown to Telegram
+
+6. Update the news fetching to also extract sentiment (positive/negative/neutral) for each headline and include a news sentiment score in the analysis
+
+Restart the bot after changes.

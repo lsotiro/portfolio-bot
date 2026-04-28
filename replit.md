@@ -44,10 +44,22 @@ Standalone Python Telegram bot (workflow: **Portfolio Bot**) — not part of the
 - Daily 08:00 UTC sweep alerts when any holding has earnings ≤ `EARNINGS_ALERT_DAYS` (3) days away, including position size, live P&L, EPS estimate, last-quarter beat/miss, and 3 actionable options.
 - `/earnings` lists upcoming earnings within 30 days.
 
+### Portfolio Health Score (0–10)
+- `calculate_health_score(portfolio, fundamentals=None)` averages four sub-scores:
+  - **Diversification** — distinct sectors (4+ → 10, 3 → 7, 2 → 4, ≤1 → 1)
+  - **Stop-loss health** — `10 - 2 × (positions below stop)`, floor 0
+  - **Upside remaining** — avg `(target − current) / current` (>30% → 10, ≥20% → 7, ≥10% → 4, else 1)
+  - **Momentum** — `(positions with positive P&L / total) × 10`
+- Rating bands: **8–10 💪 Strong**, **6–7.9 👍 Healthy**, **4–5.9 ⚠️ Needs attention**, **<4 🚨 Critical**.
+- Sector pulled from `info["sector"]` via `FUNDAMENTAL_FIELDS` so `/portfolio` reuses one bulk fetch (no extra API calls).
+- One-line summary embedded at top of `/portfolio`; full breakdown via `/health` and the daily 08:30 UTC push.
+- When data is missing for a component, score floors at 1.0 with an "(insufficient data)" note (matches the spec's lowest published bucket).
+
 ### Schedules (UTC)
 - 08:00 — earnings calendar sweep
+- 08:30 — morning portfolio health score push
 - 09:00 — full `/analyze` portfolio review
 - Day 1 of month — analyst target refresh, then `/analyze`
 
 ### Commands
-`/buy`, `/sell`, `/trim`, `/portfolio`, `/earnings`, `/analyze`, `/monthly`, `/help`
+`/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/monthly`, `/help`

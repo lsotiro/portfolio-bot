@@ -8,9 +8,11 @@ Commands you can send the bot:
   /analyze                   run the daily HOLD/SELL review on holdings
   /monthly                   run the monthly S&P 500 buy screen
   /earnings                  list upcoming earnings (next 30 days)
+  /health                    portfolio health score (0–10) with breakdown
 
 Daily schedule (UTC):
   08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
+  08:30 — morning portfolio health score push
   09:00 — full /analyze portfolio review
 
 Hard rules applied to every holding before Claude is consulted:
@@ -209,6 +211,7 @@ FUNDAMENTAL_FIELDS = (
     "returnOnEquity",
     "targetMeanPrice",
     "recommendationMean",
+    "sector",
 )
 
 
@@ -1014,6 +1017,16 @@ def handle_portfolio(chat_id):
     fundamentals = fetch_fundamentals_bulk(tickers)
     portfolio_dirty = False
 
+    # Top-of-message health summary — reuses the bulk fundamentals we just
+    # fetched so this adds zero extra API calls.
+    try:
+        health = calculate_health_score(portfolio, fundamentals)
+        summary = format_health_summary(health)
+        if summary:
+            lines.insert(1, summary)
+    except Exception as exc:
+        print(f"[health] portfolio summary failed: {exc}")
+
     for ticker, pos in portfolio.items():
         shares = pos["shares"]
         entry = pos["entry_price"]
@@ -1125,6 +1138,7 @@ def handle_start(chat_id):
         "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
         "`/portfolio` — holdings with live P&L, analyst target & upside\n"
+        "`/health` — portfolio health score (0–10) with breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
@@ -1191,6 +1205,8 @@ def poll_telegram():
                         ).start()
                     elif cmd == "/earnings":
                         handle_earnings(chat_id)
+                    elif cmd == "/health":
+                        handle_health(chat_id)
                     elif cmd == "/monthly":
                         send_telegram(
                             "Monthly buy screen started, please wait...",
@@ -1273,6 +1289,213 @@ def refresh_analyst_targets(chat_id=None, notify=True):
             body.append("")
             body.append(f"_No target available:_ {', '.join(missing)}")
         send_telegram("\n".join(body), chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Health Score (0–10) — diversification + stop / upside / momentum
+# ---------------------------------------------------------------------------
+def calculate_health_score(portfolio=None, fundamentals=None):
+    """Compute a four-component health score for the portfolio.
+
+    Components (each 0–10):
+      1. Diversification — distinct sectors across holdings
+      2. Stop-loss health — how many positions are below stop
+      3. Upside remaining — average % gap to analyst target
+      4. Momentum — share of positions with positive P&L
+
+    Final score = average of the four, rounded to 1 dp.
+
+    Returns a dict {score, rating_emoji, rating_label, components: [(name,
+    score, detail), ...]} or None if the portfolio is empty.
+
+    `fundamentals` may be passed in to reuse a bulk fetch (e.g. /portfolio).
+    """
+    if portfolio is None:
+        portfolio = load_portfolio()
+    if not portfolio:
+        return None
+    if fundamentals is None:
+        fundamentals = fetch_fundamentals_bulk(list(portfolio.keys()))
+
+    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)
+
+    rows = []
+    for ticker, pos in portfolio.items():
+        f = fundamentals.get(ticker) or {}
+        current = _safe_float(f.get("currentPrice"))
+        if current is None:
+            current = _safe_float(get_current_price(ticker))
+        target = _safe_target(pos.get("analyst_target"))
+        if target is None:
+            target = _safe_target(f.get("targetMeanPrice"))
+        sector_raw = f.get("sector")
+        sector = sector_raw.strip() if isinstance(sector_raw, str) else None
+        rows.append(
+            {
+                "ticker": ticker,
+                "entry": pos["entry_price"],
+                "shares": pos["shares"],
+                "current": current,
+                "target": target,
+                "sector": sector or None,
+                "stop_price": pos["entry_price"] * stop_factor,
+            }
+        )
+
+    # 1. Diversification
+    sectors = {r["sector"] for r in rows if r["sector"]}
+    n_sec = len(sectors)
+    if n_sec >= 4:
+        div_score = 10.0
+    elif n_sec == 3:
+        div_score = 7.0
+    elif n_sec == 2:
+        div_score = 4.0
+    else:
+        # 0 or 1 sector → 1/10
+        div_score = 1.0
+    if sectors:
+        div_detail = (
+            f"{n_sec} sector{'s' if n_sec != 1 else ''}: "
+            f"{', '.join(sorted(sectors))}"
+        )
+    else:
+        div_detail = "sector data unavailable"
+
+    # 2. Stop-loss health
+    below_stop = [
+        r["ticker"] for r in rows
+        if r["current"] is not None and r["current"] <= r["stop_price"]
+    ]
+    stop_score = float(max(0, 10 - 2 * len(below_stop)))
+    if below_stop:
+        stop_detail = (
+            f"{len(below_stop)} below stop: {', '.join(below_stop)}"
+        )
+    else:
+        stop_detail = "all positions above stop loss"
+
+    # 3. Upside remaining
+    upsides = []
+    for r in rows:
+        if r["current"] is None or r["target"] is None or r["current"] == 0:
+            continue
+        upsides.append(((r["target"] - r["current"]) / r["current"]) * 100)
+    if not upsides:
+        # Floor at 1.0 (the spec's worst published bucket) rather than 0
+        # so a missing-data signal doesn't unfairly bottom out the average.
+        ups_score = 1.0
+        ups_detail = "no analyst-target / price data (insufficient data)"
+    else:
+        avg_up = sum(upsides) / len(upsides)
+        if avg_up > 30:
+            ups_score = 10.0
+        elif avg_up >= 20:
+            ups_score = 7.0
+        elif avg_up >= 10:
+            ups_score = 4.0
+        else:
+            ups_score = 1.0
+        ups_detail = (
+            f"avg upside {avg_up:+.1f}% across {len(upsides)} "
+            f"position{'s' if len(upsides) != 1 else ''}"
+        )
+
+    # 4. Momentum
+    pos_with_price = [r for r in rows if r["current"] is not None]
+    if not pos_with_price:
+        # Floor at 1.0 — same rationale as Upside above.
+        mom_score = 1.0
+        mom_detail = "no live prices available (insufficient data)"
+    else:
+        positive = [r for r in pos_with_price if r["current"] >= r["entry"]]
+        mom_score = (len(positive) / len(pos_with_price)) * 10.0
+        mom_detail = (
+            f"{len(positive)}/{len(pos_with_price)} positions with "
+            f"positive P&L"
+        )
+
+    components = [
+        ("Diversification", div_score, div_detail),
+        ("Stop-loss health", stop_score, stop_detail),
+        ("Upside remaining", ups_score, ups_detail),
+        ("Momentum", mom_score, mom_detail),
+    ]
+
+    total = round(sum(c[1] for c in components) / len(components), 1)
+
+    if total >= 8:
+        emoji, label = "💪", "Strong"
+    elif total >= 6:
+        emoji, label = "👍", "Healthy"
+    elif total >= 4:
+        emoji, label = "⚠️", "Needs attention"
+    else:
+        emoji, label = "🚨", "Critical"
+
+    return {
+        "score": total,
+        "rating_emoji": emoji,
+        "rating_label": label,
+        "components": components,
+    }
+
+
+def format_health_summary(report):
+    """One-line summary suitable for embedding at the top of /portfolio."""
+    if report is None:
+        return None
+    return (
+        f"*Health: {report['score']}/10* "
+        f"{report['rating_emoji']} {report['rating_label']}"
+    )
+
+
+def format_health_breakdown(report):
+    """Full multi-line breakdown for /health and the 08:30 push."""
+    if report is None:
+        return "Your portfolio is empty."
+    lines = [
+        f"*Portfolio Health Score: {report['score']}/10* "
+        f"{report['rating_emoji']} {report['rating_label']}",
+        "",
+    ]
+    for name, score, detail in report["components"]:
+        # `detail` contains dynamic ticker/sector strings; we deliberately
+        # render it without Markdown emphasis so unexpected `_` or `*`
+        # characters can't break Telegram's Markdown parser.
+        lines.append(f"• *{name}:* {score:.1f}/10 — {detail}")
+    return "\n".join(lines)
+
+
+def handle_health(chat_id):
+    """`/health` — show the score and the four-component breakdown."""
+    portfolio = load_portfolio()
+    if not portfolio:
+        send_telegram("Your portfolio is empty.", chat_id)
+        return
+    report = calculate_health_score(portfolio)
+    send_telegram(format_health_breakdown(report), chat_id)
+
+
+def scheduled_health_check():
+    """Daily 08:30 UTC morning health check (between earnings and analysis)."""
+    chat_id = recall_chat()
+    if chat_id is None:
+        print("Skipping health check — no chat has interacted yet.")
+        return
+    print("[scheduled] running portfolio health check")
+    try:
+        portfolio = load_portfolio()
+        if not portfolio:
+            return
+        report = calculate_health_score(portfolio)
+        send_telegram(
+            "☀️ *Morning Health Check*\n\n" + format_health_breakdown(report),
+            chat_id,
+        )
+    except Exception as exc:
+        print(f"[scheduled] health check failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1620,6 +1843,7 @@ def scheduled_run():
 
 
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
+schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
 schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 
 
