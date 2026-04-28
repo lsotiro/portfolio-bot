@@ -2,7 +2,8 @@
 
 Commands you can send the bot:
   /buy TICKER SHARES PRICE   add a position (e.g. /buy AAPL 10 189.50)
-  /sell TICKER               remove a position from the portfolio
+  /sell TICKER [SHARES]      sell entire position, or only N shares
+  /trim TICKER               sell 50% of a position (the +15% shortcut)
   /portfolio                 show current holdings with live P&L
   /analyze                   run the daily HOLD/SELL review on holdings
   /monthly                   run the monthly S&P 500 buy screen
@@ -579,20 +580,116 @@ def handle_buy(args, chat_id):
 
 
 def handle_sell(args, chat_id):
-    # Expect: /sell AAPL
-    try:
-        ticker = args[0].upper()
-    except IndexError:
-        send_telegram("Usage: /sell TICKER", chat_id)
+    # Two forms:
+    #   /sell AAPL        -> sell entire position
+    #   /sell AAPL 5      -> sell only 5 shares (partial)
+    if not args:
+        send_telegram(
+            "Usage: /sell TICKER [SHARES]\n"
+            "Examples:\n"
+            "  /sell AAPL       (sell entire position)\n"
+            "  /sell AAPL 5     (sell only 5 shares)",
+            chat_id,
+        )
         return
 
+    ticker = args[0].upper()
     portfolio = load_portfolio()
-    if ticker in portfolio:
+
+    if ticker not in portfolio:
+        send_telegram(f"*{ticker}* is not in your portfolio.", chat_id)
+        return
+
+    pos = portfolio[ticker]
+    held = pos["shares"]
+    entry = pos["entry_price"]
+
+    # Optional second arg = shares to sell (partial)
+    if len(args) >= 2:
+        try:
+            sell_qty = float(args[1])
+        except ValueError:
+            send_telegram("Shares must be a number, e.g. /sell AAPL 5", chat_id)
+            return
+        if sell_qty <= 0:
+            send_telegram("Shares to sell must be greater than 0.", chat_id)
+            return
+        if sell_qty > held:
+            send_telegram(
+                f"You only hold {held} shares of *{ticker}* — "
+                f"cannot sell {sell_qty}.",
+                chat_id,
+            )
+            return
+    else:
+        sell_qty = held  # full close
+
+    remaining = round(held - sell_qty, 6)
+
+    if remaining <= 0:
         del portfolio[ticker]
         save_portfolio(portfolio)
-        send_telegram(f"Removed *{ticker}* from portfolio.", chat_id)
+        send_telegram(
+            f"Sold {sell_qty} *{ticker}* shares. Position closed.",
+            chat_id,
+        )
     else:
+        pos["shares"] = remaining
+        save_portfolio(portfolio)
+        send_telegram(
+            f"Sold {sell_qty} *{ticker}* shares. "
+            f"Remaining position: {remaining} shares @ ${entry:.2f}",
+            chat_id,
+        )
+
+
+def handle_trim(args, chat_id):
+    # /trim AAPL  -> sells 50% of the AAPL position (matches +15% partial alert)
+    if not args:
+        send_telegram(
+            "Usage: /trim TICKER\n"
+            "Sells 50% of your position (the +15% partial-take-profit shortcut).",
+            chat_id,
+        )
+        return
+
+    ticker = args[0].upper()
+    portfolio = load_portfolio()
+
+    if ticker not in portfolio:
         send_telegram(f"*{ticker}* is not in your portfolio.", chat_id)
+        return
+
+    pos = portfolio[ticker]
+    held = pos["shares"]
+    entry = pos["entry_price"]
+
+    # Sell half. Round to 4 decimals so the message is readable.
+    sell_qty = round(held / 2, 4)
+    remaining = round(held - sell_qty, 6)
+
+    if sell_qty <= 0:
+        send_telegram(
+            f"*{ticker}* position is too small to trim ({held} shares).",
+            chat_id,
+        )
+        return
+
+    if remaining <= 0:
+        del portfolio[ticker]
+        save_portfolio(portfolio)
+        send_telegram(
+            f"Trimmed *{ticker}* — sold {sell_qty} shares (full position).",
+            chat_id,
+        )
+    else:
+        pos["shares"] = remaining
+        save_portfolio(portfolio)
+        send_telegram(
+            f"Trimmed *{ticker}* — sold {sell_qty} shares (50%). "
+            f"Remaining position: {remaining} shares @ ${entry:.2f}",
+            chat_id,
+        )
 
 
 def handle_portfolio(chat_id):
@@ -608,25 +705,57 @@ def handle_portfolio(chat_id):
     total_cost = 0.0
     total_value = 0.0
 
+    # Pre-compute the trigger prices from the global rule constants.
+    # stop loss is negative (e.g. -7) so divide by 100 and add to 1.0
+    stop_factor = 1.0 + (STOP_LOSS_PCT / 100.0)        # e.g. 0.93
+    partial_factor = 1.0 + (PARTIAL_PROFIT_PCT / 100.0)  # e.g. 1.15
+
     for ticker, pos in portfolio.items():
         shares = pos["shares"]
         entry = pos["entry_price"]
         current = get_current_price(ticker)
+
+        stop_price = entry * stop_factor
+        partial_price = entry * partial_factor
 
         # First line: ticker, shares, entry price
         lines.append(f"*{ticker}* — {shares} shares @ ${entry:.2f}")
 
         if current is None:
             lines.append("Current: _price unavailable_")
+            lines.append(
+                f"Stop @ ${stop_price:.2f} ({STOP_LOSS_PCT:+.0f}%) | "
+                f"+15% trim @ ${partial_price:.2f}"
+            )
         else:
             pl_dollar = (current - entry) * shares
             pl_pct = ((current - entry) / entry) * 100
             emoji = "🟢" if pl_dollar >= 0 else "🔴"
             sign = "+" if pl_dollar >= 0 else "-"
+
+            # Per-share dollar distance to each trigger
+            dist_to_stop = current - stop_price          # >0 above stop
+            dist_to_partial = partial_price - current    # >0 below TP
+
+            stop_label = (
+                f"${dist_to_stop:.2f} above stop"
+                if dist_to_stop >= 0
+                else f"${abs(dist_to_stop):.2f} *below* stop"
+            )
+            tp_label = (
+                f"${dist_to_partial:.2f} to +15%"
+                if dist_to_partial >= 0
+                else f"+15% hit (${abs(dist_to_partial):.2f} past)"
+            )
+
             lines.append(
                 f"Current: ${current:.2f} | "
                 f"P&L: {sign}${abs(pl_dollar):.2f} "
                 f"({sign}{abs(pl_pct):.1f}%) {emoji}"
+            )
+            lines.append(
+                f"Stop @ ${stop_price:.2f} → {stop_label} | "
+                f"+15% TP @ ${partial_price:.2f} → {tp_label}"
             )
             total_cost += entry * shares
             total_value += current * shares
@@ -653,8 +782,9 @@ def handle_start(chat_id):
         "Welcome to *Portfolio Bot*\n\n"
         "Commands:\n"
         "`/buy TICKER SHARES PRICE` — add a position\n"
-        "`/sell TICKER` — remove a position\n"
-        "`/portfolio` — show holdings with live P&L\n"
+        "`/sell TICKER [SHARES]` — sell whole position or N shares\n"
+        "`/trim TICKER` — sell 50% of a position (the +15% shortcut)\n"
+        "`/portfolio` — holdings with live P&L + stop/TP distances\n"
         "`/analyze` — daily HOLD/SELL review on holdings\n"
         "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n\n"
         "_Hard rules: forced SELL at -7% stop loss or +25% take profit._\n"
@@ -703,6 +833,8 @@ def poll_telegram():
                         handle_buy(args, chat_id)
                     elif cmd == "/sell":
                         handle_sell(args, chat_id)
+                    elif cmd == "/trim":
+                        handle_trim(args, chat_id)
                     elif cmd == "/portfolio":
                         handle_portfolio(chat_id)
                     elif cmd == "/analyze":
