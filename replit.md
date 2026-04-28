@@ -115,8 +115,26 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 - 07:30 — recommendation review check (4w/8w grading)
 - 08:00 — earnings calendar sweep (and Sunday-only weekly summary)
 - 08:30 — morning portfolio health score push
-- 09:00 — full `/analyze` portfolio review
-- Day 1 of month — analyst target refresh, then `/analyze`
+- 21:30 — lightweight daily monitor (runs 30 min after US market close
+  so today's % move from `regularMarketPreviousClose` is meaningful;
+  a pre-open run would compare yesterday's close to itself and the
+  >3% mover trigger would never fire)
+
+### Daily Monitor (lightweight)
+- Bulk-fetches basic fundamentals (one API call) → gives current price,
+  previous close, and fresh analyst target for every holding.
+- **Refreshes the analyst target on every position every run** (replaces
+  the old day-1-of-month bulk refresh). Resets the per-position alert
+  flags whenever the target changes meaningfully.
+- One-line-per-position summary with hard-rule SELL signals (stop-loss,
+  above analyst fair value) — no Claude framework call by default.
+- **>3% single-day move →** auto-fires `analyze_stock_deep` in a
+  background thread for that ticker, sends the full 5-pillar analysis
+  to Telegram, and logs it to the feedback loop with `source=daily-mover`.
+- **>5% single-day move →** also alerts if the analyst target shifted
+  by ≥5% on the same day ("re-evaluate the thesis").
+- `/buy` separately triggers its own deep analysis on the new position
+  (background thread → confirmation Telegram + feedback-loop log).
 
 ### Commands
 `/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`

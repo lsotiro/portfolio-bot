@@ -224,6 +224,10 @@ FUNDAMENTAL_FIELDS = (
     "targetMeanPrice",
     "recommendationMean",
     "sector",
+    # Used by the daily monitor to compute the single-day move % so we
+    # can trigger deep analysis on big movers (>3%) and target alerts
+    # on bigger movers (>5%).
+    "regularMarketPreviousClose",
 )
 
 
@@ -948,7 +952,47 @@ One paragraph, grounded in the numbers above.
 # ---------------------------------------------------------------------------
 # Daily review — used by /analyze and the scheduler
 # ---------------------------------------------------------------------------
+def _trigger_deep_for_mover(ticker, move_pct, position, chat_id):
+    """Background helper — runs full deep analysis for a >3% single-day mover."""
+    try:
+        rich = get_rich_fundamentals(ticker)
+        if not rich:
+            return
+        news = get_stock_news(ticker, days=7, page_size=5)
+        result = analyze_stock_deep(ticker, rich, position, news)
+        send_telegram(
+            f"📈 *{ticker}* moved {move_pct:+.1f}% today — auto deep analysis:\n\n"
+            f"{result}",
+            chat_id,
+        )
+        # Log to feedback loop so big-mover deep-dives count toward track record.
+        try:
+            parsed = parse_framework_blocks(result)
+            log_recommendations(
+                parsed,
+                price_lookup=lambda _t: rich.get("currentPrice"),
+                analyst_lookup=lambda _t: _safe_target(rich.get("targetMeanPrice")),
+                source="daily-mover",
+            )
+        except Exception as exc:
+            print(f"[recs] mover deep-log failed for {ticker}: {exc}")
+    except Exception as exc:
+        print(f"[mover {ticker}] deep analysis failed: {exc}")
+
+
 def run_analysis(chat_id):
+    """Lightweight daily monitor.
+
+    Workflow:
+      1. Bulk-fetch fundamentals (refreshes analyst target for every holding).
+      2. For each position: refresh target (alerting on changes for big movers),
+         compute today's % move from previousClose, and apply hard SELL rules.
+      3. Send a one-line-per-position summary (no Claude framework call).
+      4. Spawn background deep analyses for any position moving > 3% today.
+      5. Send target-change alerts for any position moving > 5% today whose
+         analyst consensus also shifted significantly.
+      6. Log forced SELL signals to the feedback-loop log.
+    """
     portfolio = load_portfolio()
     if not portfolio:
         send_telegram(
@@ -957,85 +1001,93 @@ def run_analysis(chat_id):
         )
         return
 
-    send_telegram(
-        "*Running daily portfolio review...*\n"
-        "Fetching live prices and fundamentals.",
-        chat_id,
-    )
+    send_telegram("*Running daily portfolio monitor…*", chat_id)
 
     tickers = list(portfolio.keys())
-    # Rich fetch — superset of the basic snapshot, plus analyst conviction
-    # and quarterly earnings trend, so the 5-pillar Claude framework has
-    # everything it needs in a single bulk call.
-    fundamentals = fetch_rich_fundamentals_bulk(tickers)
+    # Basic bulk fetch is sufficient for the lightweight monitor — gives us
+    # currentPrice, regularMarketPreviousClose, and the fresh analyst target.
+    fundamentals = fetch_fundamentals_bulk(tickers)
 
     judged_positions = []
-    forced_lines = []
-    alert_lines = []  # soft alerts (approaching fair value)
-    info_lines = []   # informational (big upside remaining, etc.)
-    portfolio_dirty = False  # set True if state changes & needs saving
+    target_changes = []   # (ticker, old, new) — for any position
+    big_movers_3 = []     # >= 3% single-day move → trigger deep analysis
+    big_movers_5 = []     # >= 5% single-day move → target-change alert
+    portfolio_dirty = False
 
     for ticker, pos in portfolio.items():
-        f = fundamentals.get(ticker)
-        # Prefer the live price embedded in fundamentals; fall back otherwise.
-        current = (f or {}).get("currentPrice") or get_current_price(ticker)
+        f = fundamentals.get(ticker) or {}
+        current = f.get("currentPrice") or get_current_price(ticker)
+        prev_close = f.get("regularMarketPreviousClose")
+
         if current is None:
-            forced_lines.append(f"{ticker} — UNKNOWN — could not fetch price")
+            judged_positions.append({
+                "ticker": ticker, "shares": pos["shares"],
+                "entry_price": pos["entry_price"], "current_price": None,
+                "analyst_target": _safe_target(pos.get("analyst_target")),
+                "pl_pct": None, "move_pct": None,
+                "forced_signal": None,
+                "forced_reason": "could not fetch price",
+            })
             continue
+
         pl_pct = round(
             ((current - pos["entry_price"]) / pos["entry_price"]) * 100, 2
         )
 
-        # Resolve the analyst target. Prefer the value stored at /buy time.
-        # If the position pre-dates the new system, lazily fetch and persist.
-        # _safe_target normalises 0/NaN/None to None so the math stays safe.
-        target = _safe_target(pos.get("analyst_target"))
-        if target is None and f:
-            live_target = _safe_target(f.get("targetMeanPrice"))
-            if live_target is not None:
-                target = live_target
-                pos["analyst_target"] = target
-                portfolio_dirty = True
+        # Single-day % move — used to trigger 3%/5% behaviors below.
+        move_pct = None
+        if prev_close and prev_close > 0:
+            move_pct = ((current - prev_close) / prev_close) * 100
 
-        # Per-position alert state for the target-based system.
-        approach_alerted = pos.get("approach_alerted", False)
-        above_alerted = pos.get("above_alerted", False)
+        # Refresh the analyst target every morning (replaces the old monthly
+        # refresh). Any meaningful change resets the per-position alert flags
+        # so the new target gets a fresh evaluation.
+        old_target = _safe_target(pos.get("analyst_target"))
+        new_target = _safe_target(f.get("targetMeanPrice"))
+        if new_target is not None and (
+            old_target is None or abs(new_target - old_target) >= 0.01
+        ):
+            pos["analyst_target"] = new_target
+            pos["approach_alerted"] = False
+            pos["above_alerted"] = False
+            portfolio_dirty = True
+            if old_target is not None:
+                target_changes.append((ticker, old_target, new_target))
+        target = new_target if new_target is not None else old_target
 
         forced_signal = None
         forced_reason = None
 
-        # --- Hard stop loss (capital protection — always wins) ---
+        # --- Hard stop loss ---
         if pl_pct <= STOP_LOSS_PCT:
             forced_signal = "SELL"
             forced_reason = (
                 f"hard stop loss hit (P/L {pl_pct}% ≤ {STOP_LOSS_PCT}%)"
             )
 
-        # --- Above analyst fair value (forced SELL + strong alert) ---
+        # --- Above analyst fair value ---
         elif target is not None and current >= ABOVE_TARGET_FRACTION * target:
             pct_of_target = (current / target) * 100
             forced_signal = "SELL"
             forced_reason = (
-                f"ABOVE FAIR VALUE — strong sell signal "
-                f"(${current:.2f} ≥ ${target:.2f} target — "
-                f"{pct_of_target:.0f}% of target)"
+                f"ABOVE FAIR VALUE — ${current:.2f} ≥ ${target:.2f} "
+                f"({pct_of_target:.0f}% of target)"
             )
-            if not above_alerted:
+            if not pos.get("above_alerted"):
                 send_telegram(
                     f"🚨 *{ticker}* ABOVE FAIR VALUE — strong sell signal. "
-                    f"Price ${current:.2f} is now "
-                    f"{pct_of_target:.0f}% of analyst target ${target:.2f}.",
+                    f"Price ${current:.2f} is {pct_of_target:.0f}% of analyst "
+                    f"target ${target:.2f}.",
                     chat_id,
                 )
                 pos["above_alerted"] = True
-                # If we're above fair value we're also past the approach line.
                 pos["approach_alerted"] = True
                 portfolio_dirty = True
 
         # --- Approaching fair value (soft alert, not a forced SELL) ---
         elif target is not None and current >= APPROACH_TARGET_FRACTION * target:
             pct_of_target = (current / target) * 100
-            if not approach_alerted:
+            if not pos.get("approach_alerted"):
                 send_telegram(
                     f"⚠️ *{ticker}* APPROACHING FAIR VALUE — consider selling. "
                     f"Price ${current:.2f} is {pct_of_target:.0f}% of "
@@ -1044,130 +1096,113 @@ def run_analysis(chat_id):
                 )
                 pos["approach_alerted"] = True
                 portfolio_dirty = True
-            alert_lines.append(
-                f"{ticker} — APPROACHING FAIR VALUE — ${current:.2f} is "
-                f"{pct_of_target:.0f}% of ${target:.2f} target "
-                f"(consider selling)"
-            )
 
-        # --- Big upside remaining (info only, no alert) ---
-        elif target is not None and current <= LOW_TARGET_FRACTION * target:
-            upside_dollar = target - current
-            upside_pct = ((target - current) / current) * 100
-            info_lines.append(
-                f"{ticker} — UPSIDE — +${upside_dollar:.2f}/share "
-                f"({upside_pct:+.0f}%) remaining to analyst target "
-                f"${target:.2f} (current ${current:.2f})"
-            )
+        judged_positions.append({
+            "ticker": ticker,
+            "shares": pos["shares"],
+            "entry_price": pos["entry_price"],
+            "current_price": current,
+            "analyst_target": target,
+            "pl_pct": pl_pct,
+            "move_pct": move_pct,
+            "forced_signal": forced_signal,
+            "forced_reason": forced_reason,
+        })
 
-        judged_positions.append(
-            {
-                "ticker": ticker,
-                "shares": pos["shares"],
-                "entry_price": pos["entry_price"],
-                "current_price": current,
-                "analyst_target": target,
-                "pl_pct": pl_pct,
-                "fundamentals": f,
-                "forced_signal": forced_signal,
-                "forced_reason": forced_reason,
-            }
-        )
-        if forced_signal:
-            forced_lines.append(
-                f"{ticker} — {forced_signal} — {forced_reason}"
-            )
+        if move_pct is not None and abs(move_pct) >= 3.0:
+            big_movers_3.append((ticker, move_pct, dict(pos)))
+        if (
+            move_pct is not None and abs(move_pct) >= 5.0
+            and old_target is not None and new_target is not None
+        ):
+            big_movers_5.append((ticker, move_pct, old_target, new_target))
 
-    # Persist any newly-fired alert flags or lazy-fetched targets.
     if portfolio_dirty:
         save_portfolio(portfolio)
 
-    if not judged_positions:
+    if not any(p["current_price"] for p in judged_positions):
         send_telegram(
             "Could not fetch current prices for any of your holdings.",
             chat_id,
         )
         return
 
-    # Fetch last-24h news for every holding (in parallel) so Claude has it.
-    held_tickers = [p["ticker"] for p in judged_positions]
-    news_map = fetch_news_bulk(held_tickers, days=1)
-    print(
-        f"[daily] fetched news for {sum(1 for v in news_map.values() if v)}"
-        f" / {len(held_tickers)} tickers"
-    )
-
-    # Ask Claude to judge the remaining (non-forced) positions, with news.
-    needs_claude = [p for p in judged_positions if not p["forced_signal"]]
-    if needs_claude:
-        claude_output = analyze_portfolio_with_claude(judged_positions, news_map)
-    else:
-        claude_output = (
-            "PORTFOLIO REVIEW:\n(all positions decided by hard rules)\n\n"
-            "URGENT ALERTS: (none)"
+    # --- Lightweight one-line-per-position summary ---
+    lines = ["*Daily portfolio monitor*", ""]
+    for p in judged_positions:
+        if p["current_price"] is None:
+            lines.append(f"⚪ *{p['ticker']}* — price unavailable")
+            continue
+        signal = p["forced_signal"] or "HOLD"
+        if signal == "SELL":
+            emoji = "🔴"
+        elif p["pl_pct"] >= 0:
+            emoji = "🟢"
+        else:
+            emoji = "🟡"
+        move = (
+            f" ({p['move_pct']:+.1f}% today)"
+            if p["move_pct"] is not None else ""
+        )
+        tail = f" — {p['forced_reason']}" if p["forced_reason"] else ""
+        lines.append(
+            f"{emoji} *{p['ticker']}* — ${p['current_price']:.2f}{move} — "
+            f"*{signal}* — entry ${p['entry_price']:.2f} "
+            f"({p['pl_pct']:+.1f}%){tail}"
         )
 
-    # Forward each URGENT ALERT as its own immediate Telegram message.
-    urgent = parse_urgent_alerts(claude_output)
-    for line in urgent:
-        send_telegram(f"🚨 *URGENT* — {line}", chat_id)
+    if target_changes:
+        lines.append("")
+        lines.append("_Analyst targets refreshed:_")
+        for t, old, new in target_changes:
+            arrow = "↑" if new > old else "↓"
+            lines.append(f"  • {t}: ${old:.2f} → ${new:.2f} {arrow}")
 
-    # Feedback loop — log every SELL signal the daily monitor produces.
+    send_telegram("\n".join(lines), chat_id)
+
+    # --- Target-change alerts for big movers (>= 5%) ---
+    for ticker, move_pct, old_t, new_t in big_movers_5:
+        target_change_pct = ((new_t - old_t) / old_t) * 100
+        if abs(target_change_pct) >= 5.0:
+            send_telegram(
+                f"⚡ *{ticker}* moved *{move_pct:+.1f}% today* AND analyst "
+                f"target was revised: ${old_t:.2f} → ${new_t:.2f} "
+                f"({target_change_pct:+.1f}%) — re-evaluate the thesis.",
+                chat_id,
+            )
+
+    # --- Auto-trigger deep analysis on >3% movers (background threads) ---
+    for ticker, move_pct, position in big_movers_3:
+        Thread(
+            target=_trigger_deep_for_mover,
+            args=(ticker, move_pct, position, chat_id),
+            daemon=True,
+        ).start()
+
+    # --- Feedback loop — log forced SELL signals from the daily monitor ---
     try:
-        parsed = parse_framework_blocks(claude_output)
+        sells = [
+            {
+                "ticker": p["ticker"],
+                "total_score": None,
+                "signal": "SELL",
+                "claude_target": None,
+                "stop_loss": None,
+                "bull_case": None,
+                "bear_case": p["forced_reason"],
+            }
+            for p in judged_positions if p["forced_signal"] == "SELL"
+        ]
         price_by_t = {p["ticker"]: p["current_price"] for p in judged_positions}
         target_by_t = {p["ticker"]: p["analyst_target"] for p in judged_positions}
         log_recommendations(
-            [b for b in parsed if (b.get("signal") or "").upper() == "SELL"],
+            sells,
             price_lookup=lambda t: price_by_t.get(t),
             analyst_lookup=lambda t: target_by_t.get(t),
             source="daily",
         )
     except Exception as exc:
         print(f"[recs] daily SELL logging failed: {exc}")
-
-    # Position status block — coloured one-line summary per holding so the
-    # report is scannable at a glance.
-    status_lines = []
-    for p in judged_positions:
-        ticker = p["ticker"]
-        cur = p["current_price"]
-        entry = p["entry_price"]
-        plp = p["pl_pct"]
-        emo = _status_emoji(plp)
-        stop_price = entry * (1.0 + STOP_LOSS_PCT / 100.0)
-        sign = "+" if plp >= 0 else "-"
-        if plp >= 0:
-            tail = f"+{plp:.1f}% above entry"
-        elif plp > STOP_LOSS_PCT:
-            cushion_pct = ((cur - stop_price) / stop_price) * 100
-            tail = (
-                f"{sign}{abs(plp):.1f}% below entry — "
-                f"{cushion_pct:.1f}% above stop"
-            )
-        else:
-            tail = f"{sign}{abs(plp):.1f}% — *BELOW STOP — urgent*"
-        status_lines.append(f"{emo} *{ticker}* — {tail}")
-
-    sections = ["*Daily Portfolio Report*", ""]
-    if status_lines:
-        sections.append("*Holdings status:*")
-        sections.extend(status_lines)
-        sections.append("")
-    if forced_lines:
-        sections.append("*Hard-rule SELLs (override fundamentals):*")
-        sections.extend(forced_lines)
-        sections.append("")
-    if alert_lines:
-        sections.append("*Approaching fair value:*")
-        sections.extend(alert_lines)
-        sections.append("")
-    if info_lines:
-        sections.append("*Upside remaining (well below fair value):*")
-        sections.extend(info_lines)
-        sections.append("")
-    sections.append(claude_output)
-    send_telegram("\n".join(sections), chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2966,14 +3001,9 @@ def scheduled_run():
     if chat_id is None:
         print("Skipping scheduled run — no chat has interacted with the bot yet.")
         return
-    # On the 1st of the month, refresh analyst targets BEFORE running
-    # the analysis so the day's review uses the freshest numbers.
-    if datetime.utcnow().day == 1:
-        print("[monthly] refreshing analyst targets")
-        try:
-            refresh_analyst_targets(chat_id=chat_id)
-        except Exception as exc:
-            print(f"[monthly] target refresh failed: {exc}")
+    # The daily monitor itself now refreshes analyst targets for every
+    # holding on every run, so the old day-1-of-month bulk refresh is
+    # no longer needed.
     run_analysis(chat_id)
 
 
@@ -2981,7 +3011,12 @@ schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
-schedule.every().day.at("09:00", "UTC").do(scheduled_run)
+# Daily monitor runs at 21:30 UTC — 30 min after US market close
+# (16:00 ET = 20:00/21:00 UTC depending on DST). This is the earliest
+# point at which currentPrice and regularMarketPreviousClose differ in
+# a way that lets the >3% / >5% mover logic actually fire — running it
+# pre-open would compare yesterday's close to itself.
+schedule.every().day.at("21:30", "UTC").do(scheduled_run)
 
 
 # ---------------------------------------------------------------------------
@@ -2991,7 +3026,8 @@ if __name__ == "__main__":
     Thread(target=keep_alive, daemon=True).start()
     Thread(target=poll_telegram, daemon=True).start()
 
-    print("Portfolio Bot started. Daily analysis scheduled at 09:00 UTC.")
+    print("Portfolio Bot started. Daily analysis scheduled at 21:30 UTC "
+          "(post US market close).")
     while True:
         schedule.run_pending()
         time.sleep(30)
