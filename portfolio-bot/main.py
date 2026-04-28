@@ -21,7 +21,7 @@ import os
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Thread
 
 import anthropic
@@ -48,9 +48,12 @@ SCREEN_MIN_EARNINGS_GROWTH = 0.10    # > 10%
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
 
 PORTFOLIO_FILE = "portfolio.json"   # where positions are stored
 LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
+
+NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +175,73 @@ def get_fundamentals(ticker):
     return snap
 
 
+def get_stock_news(ticker, days=1, page_size=5):
+    """Fetch the most recent NewsAPI headlines for a ticker.
+
+    Returns a list of dicts: [{title, source, publishedAt, url}, ...]
+    Empty list on any error or if NEWS_API_KEY is missing.
+    """
+    if not NEWS_API_KEY:
+        return []
+    # NewsAPI accepts ISO-8601 'from' timestamps. Use UTC `days` ago.
+    from_dt = datetime.utcnow() - timedelta(days=days)
+    params = {
+        "q": ticker,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": page_size,
+        "from": from_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "apiKey": NEWS_API_KEY,
+    }
+    try:
+        r = requests.get(NEWS_ENDPOINT, params=params, timeout=10)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception:
+        return []
+    out = []
+    for art in (data.get("articles") or [])[:page_size]:
+        out.append(
+            {
+                "title": (art.get("title") or "").strip(),
+                "source": (art.get("source") or {}).get("name", ""),
+                "publishedAt": art.get("publishedAt", "")[:10],
+                "url": art.get("url", ""),
+            }
+        )
+    return out
+
+
+def fetch_news_bulk(tickers, days=1, max_workers=10):
+    """Fetch news for many tickers in parallel. Returns {ticker: [articles]}."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(get_stock_news, t, days): t for t in tickers
+        }
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                results[t] = fut.result() or []
+            except Exception:
+                results[t] = []
+    return results
+
+
+def format_news_block(ticker, articles):
+    """One-block summary of news for a ticker, suitable for prompts."""
+    if not articles:
+        return f"{ticker}: (no recent news)"
+    lines = [f"{ticker}:"]
+    for a in articles:
+        date = a.get("publishedAt") or "?"
+        src = a.get("source") or "?"
+        title = a.get("title") or "(no title)"
+        lines.append(f"  - [{date}] {src}: {title}")
+    return "\n".join(lines)
+
+
 def fetch_fundamentals_bulk(tickers, max_workers=10):
     """Fetch fundamentals for a list of tickers in parallel."""
     results = {}
@@ -235,13 +305,16 @@ def fundamentals_line(ticker, f):
 # ---------------------------------------------------------------------------
 # Claude analysis — daily portfolio review (HOLD / SELL with fundamentals)
 # ---------------------------------------------------------------------------
-def analyze_portfolio_with_claude(judged_positions):
+def analyze_portfolio_with_claude(judged_positions, news_map):
     """Ask Claude for HOLD/SELL on each non-hard-rule position.
 
     `judged_positions` is a list of dicts that already had the hard
-    stop-loss / take-profit rule applied. Items with `forced_signal` set
-    are passed in as context but Claude is only asked to decide the
-    'undecided' ones.
+    stop-loss / take-profit rule applied. `news_map` is {ticker: [articles]}
+    for the last 24 hours.
+
+    Claude is also asked to flag CRITICAL negative news (scandal, guidance
+    cut, CEO resignation, fraud) in a separate URGENT ALERTS block which the
+    caller parses and forwards as immediate Telegram alerts.
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -269,22 +342,40 @@ def analyze_portfolio_with_claude(judged_positions):
         if p.get("forced_signal")
     ) or "(none)"
 
+    news_text = "\n\n".join(
+        format_news_block(p["ticker"], news_map.get(p["ticker"], []))
+        for p in judged_positions
+    ) or "(no news available)"
+
     prompt = f"""You are a senior equity analyst doing a daily portfolio review.
 
-CURRENT POSITIONS (with live price, P/L, and fundamentals):
+CURRENT POSITIONS (live price, P/L, fundamentals):
 {portfolio_text}
 
 POSITIONS ALREADY MARKED SELL BY HARD RULES (do not change these):
 {forced_text}
 
+RECENT NEWS (last 24h, NewsAPI headlines):
+{news_text}
+
 For every position NOT already in the hard-rule list above, output a clear
-HOLD or SELL signal with ONE sentence of reasoning. Use BOTH price action
-AND fundamentals. Consider:
+HOLD or SELL signal with ONE sentence of reasoning. Use price action,
+fundamentals AND news together. Consider:
   - revenue growth, earnings growth, profit margins, ROE trend
   - valuation (forward PE, analyst target vs current price)
   - leverage (debt/equity)
   - analyst consensus (recommendationMean — lower is more bullish)
+  - news flow / sentiment shifts
   - momentum reversal or clearly stronger opportunities elsewhere
+
+ADDITIONALLY, scan the news for any CRITICAL negative event for any holding:
+  - accounting scandal or fraud
+  - earnings / guidance cut, missed forecast
+  - CEO/CFO resignation or termination
+  - regulatory action, lawsuit with material impact
+  - major data breach or operational failure
+List each one in an URGENT ALERTS section. If there are none, write
+"URGENT ALERTS: (none)".
 
 Format the reply EXACTLY like this:
 
@@ -292,6 +383,10 @@ PORTFOLIO REVIEW:
 TICKER — HOLD or SELL — reason
 TICKER — HOLD or SELL — reason
 ...
+
+URGENT ALERTS:
+TICKER — short description of the critical event (one line each)
+(or "(none)")
 
 Be direct and concise."""
 
@@ -306,11 +401,42 @@ Be direct and concise."""
     )
 
 
+def parse_urgent_alerts(claude_text):
+    """Extract URGENT ALERTS lines from Claude's reply.
+
+    Returns a list of strings (one per alert, without the URGENT prefix).
+    Returns [] if the section is absent or contains "(none)".
+    """
+    if not claude_text or "URGENT ALERTS" not in claude_text.upper():
+        return []
+    # Split on the URGENT ALERTS marker (case-insensitive)
+    upper = claude_text.upper()
+    idx = upper.index("URGENT ALERTS")
+    block = claude_text[idx:]
+    # Drop the header line
+    lines = block.splitlines()[1:]
+    alerts = []
+    for raw in lines:
+        line = raw.strip().lstrip("-").lstrip("•").strip()
+        if not line:
+            continue
+        if line.lower().startswith("(none)") or line.lower() == "none":
+            continue
+        # Stop if Claude started a new section
+        if line.endswith(":") and line.upper() == line:
+            break
+        alerts.append(line)
+    return alerts
+
+
 # ---------------------------------------------------------------------------
 # Claude analysis — monthly buy screen
 # ---------------------------------------------------------------------------
-def pick_monthly_buys_with_claude(candidates):
-    """Ask Claude to pick the top 2 BUY opportunities from screened candidates."""
+def pick_monthly_buys_with_claude(candidates, news_map):
+    """Ask Claude to pick the top 2 BUY opportunities from screened candidates.
+
+    `news_map` is {ticker: [articles]} for the last 7 days.
+    """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     rows = []
@@ -329,6 +455,11 @@ def pick_monthly_buys_with_claude(candidates):
         )
     candidates_text = "\n".join(rows)
 
+    news_text = "\n\n".join(
+        format_news_block(c["ticker"], news_map.get(c["ticker"], []))
+        for c in candidates
+    ) or "(no news available)"
+
     prompt = f"""You are a senior equity analyst running a monthly buy screen.
 
 The candidates below have ALREADY passed a strict fundamentals filter:
@@ -338,7 +469,13 @@ ROE > 15%, forward PE < 25, analyst recommendationMean < 2.0.
 CANDIDATES:
 {candidates_text}
 
-Pick the TOP 2 BUY opportunities. For each, decide a conviction rating:
+RECENT NEWS (last 7 days, NewsAPI headlines):
+{news_text}
+
+Pick the TOP 2 BUY opportunities. Use both fundamentals AND news flow —
+strong recent news / catalyst is a tailwind; bad news (scandal, guidance
+cut, executive departure, fraud) DISQUALIFIES a candidate even if the
+fundamentals look good. For each, decide a conviction rating:
   - STRONG → suggested position size $500
   - MEDIUM → suggested position size $300
 
@@ -493,12 +630,28 @@ def run_analysis(chat_id):
         )
         return
 
-    # Ask Claude to judge the remaining (non-forced) positions
+    # Fetch last-24h news for every holding (in parallel) so Claude has it.
+    held_tickers = [p["ticker"] for p in judged_positions]
+    news_map = fetch_news_bulk(held_tickers, days=1)
+    print(
+        f"[daily] fetched news for {sum(1 for v in news_map.values() if v)}"
+        f" / {len(held_tickers)} tickers"
+    )
+
+    # Ask Claude to judge the remaining (non-forced) positions, with news.
     needs_claude = [p for p in judged_positions if not p["forced_signal"]]
     if needs_claude:
-        claude_output = analyze_portfolio_with_claude(judged_positions)
+        claude_output = analyze_portfolio_with_claude(judged_positions, news_map)
     else:
-        claude_output = "PORTFOLIO REVIEW:\n(all positions decided by hard rules)"
+        claude_output = (
+            "PORTFOLIO REVIEW:\n(all positions decided by hard rules)\n\n"
+            "URGENT ALERTS: (none)"
+        )
+
+    # Forward each URGENT ALERT as its own immediate Telegram message.
+    urgent = parse_urgent_alerts(claude_output)
+    for line in urgent:
+        send_telegram(f"🚨 *URGENT* — {line}", chat_id)
 
     sections = ["*Daily Portfolio Report*", ""]
     if forced_lines:
@@ -544,7 +697,15 @@ def run_monthly_screen(chat_id):
         )
         return
 
-    picks = pick_monthly_buys_with_claude(candidates)
+    # Fetch 7-day news for each candidate so Claude can weigh recent catalysts.
+    cand_tickers = [c["ticker"] for c in candidates]
+    news_map = fetch_news_bulk(cand_tickers, days=7)
+    print(
+        f"[monthly] fetched news for {sum(1 for v in news_map.values() if v)}"
+        f" / {len(cand_tickers)} candidates"
+    )
+
+    picks = pick_monthly_buys_with_claude(candidates, news_map)
     header = (
         f"*Monthly Buy Screen*\n"
         f"_{len(candidates)} of {len(fundamentals_map)} stocks passed "
