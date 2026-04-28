@@ -138,3 +138,25 @@ graded against SPY at the 4-week and 8-week marks, and surfaced via
 
 ### Commands
 `/buy`, `/sell`, `/trim`, `/portfolio`, `/health`, `/earnings`, `/analyze`, `/deep TICKER`, `/monthly`, `/review`, `/performance`, `/help`
+
+### Web Dashboard (`portfolio-bot/dashboard.py`)
+- Separate Flask app started in its own daemon thread from `main.py`.
+- Tries port **8080** first; if taken (e.g. by the api-server artifact)
+  falls back to 8082, 8083, or 8084 — actual port logged at startup.
+- Reads `portfolio.json` and `recommendations_log.json`; bulk-fetches
+  live prices/fundamentals via yfinance on every page load.
+- Renders a dark, mobile-friendly page with: portfolio summary
+  (value, P&L $/%, position count, cost basis), 4-component health
+  score (same calc as `/health`), a colour-coded holdings table
+  (green ≥ entry, yellow between stop and entry, red ≤ stop) with
+  analyst target + upside %, last 5 recommendations, and the bot's
+  track record (total / closed / win rate / avg return / best+worst).
+- Auto-refreshes every 60 seconds via meta-refresh.
+- 30-second server-side TTL cache (`_cache` + `_cache_lock`) collapses
+  concurrent requests / multiple open tabs into a single yfinance
+  fetch and falls back to last-known-good if a refresh fails.
+- `main.py` aliases itself in `sys.modules` as both `__main__` and
+  `main` at boot so `dashboard.py`'s lazy `from main import …` returns
+  the running instance and never double-executes the script (which
+  would otherwise re-register every `schedule` job and create a
+  second Flask app).

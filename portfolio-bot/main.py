@@ -40,12 +40,22 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from threading import Thread
+
+# This file is launched as `python3 portfolio-bot/main.py`, so its
+# module name in sys.modules is "__main__". Without this alias, any
+# helper module that does `from main import ...` would cause Python
+# to RE-EXECUTE this entire file as a separate "main" module — which
+# would re-register every schedule.every() job, duplicate the Flask
+# app instance, and split the global state. Aliasing here ensures
+# every importer gets the one and only running instance.
+sys.modules.setdefault("main", sys.modules[__name__])
 
 import anthropic
 import requests
@@ -3025,6 +3035,14 @@ schedule.every().day.at("21:30", "UTC").do(scheduled_run)
 if __name__ == "__main__":
     Thread(target=keep_alive, daemon=True).start()
     Thread(target=poll_telegram, daemon=True).start()
+
+    # Web dashboard — separate Flask app, runs in its own thread so it
+    # doesn't block the bot. Tries port 8080 first, falls back to the
+    # next free port if 8080 is taken by another artifact. Imported
+    # here (rather than at module top) so dashboard.py can lazily
+    # import from this module without a circular dependency.
+    from dashboard import start_dashboard
+    Thread(target=start_dashboard, daemon=True).start()
 
     print("Portfolio Bot started. Daily analysis scheduled at 21:30 UTC "
           "(post US market close).")
