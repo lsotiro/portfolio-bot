@@ -26,3 +26,13 @@ externalPort = 8080
 [[ports]]
 localPort = 8081
 externalPort = 80
+
+[userenv]
+
+[userenv.shared]
+ANTHROPIC_API_KEY = "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"
+ALPHA_VANTAGE_KEY = "IST0Z7GTCSUGTS8Y"
+TELEGRAM_TOKEN = "8738749400:AAEQ3dNVoboEo6Fsh2WphLjP4q-gWjknztQ"
+
+[nix]
+channel = "stable-25_05"
