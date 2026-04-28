@@ -313,10 +313,46 @@ def handle_portfolio(chat_id):
         return
 
     lines = ["*Your Portfolio*", ""]
+    total_cost = 0.0
+    total_value = 0.0
+
     for ticker, pos in portfolio.items():
+        shares = pos["shares"]
+        entry = pos["entry_price"]
+        current = get_current_price(ticker)
+
+        # First line: ticker, shares, entry price
+        lines.append(f"*{ticker}* — {shares} shares @ ${entry:.2f}")
+
+        if current is None:
+            lines.append("Current: _price unavailable_")
+        else:
+            pl_dollar = (current - entry) * shares
+            pl_pct = ((current - entry) / entry) * 100
+            emoji = "🟢" if pl_dollar >= 0 else "🔴"
+            sign = "+" if pl_dollar >= 0 else "-"
+            lines.append(
+                f"Current: ${current:.2f} | "
+                f"P&L: {sign}${abs(pl_dollar):.2f} "
+                f"({sign}{abs(pl_pct):.1f}%) {emoji}"
+            )
+            total_cost += entry * shares
+            total_value += current * shares
+
+        lines.append("")  # blank line between positions
+
+    if total_cost > 0:
+        total_pl = total_value - total_cost
+        total_pct = (total_pl / total_cost) * 100
+        emoji = "🟢" if total_pl >= 0 else "🔴"
+        sign = "+" if total_pl >= 0 else "-"
         lines.append(
-            f"`{ticker}` — {pos['shares']} shares @ ${pos['entry_price']}"
+            f"*Total* — Cost: ${total_cost:.2f} | "
+            f"Value: ${total_value:.2f} | "
+            f"P&L: {sign}${abs(total_pl):.2f} "
+            f"({sign}{abs(total_pct):.1f}%) {emoji}"
         )
+
     send_telegram("\n".join(lines), chat_id)
 
 
