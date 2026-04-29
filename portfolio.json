@@ -12,7 +12,14 @@
     "tightened_stop": false,
     "atr_pct": 4.33,
     "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-04-29"
+    "atr_last_calc": "2026-04-29",
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 25
+      }
+    ],
+    "last_signal": "SELL"
   },
   "ADSK": {
     "shares": 2.0,
@@ -27,7 +34,14 @@
     "tightened_stop": false,
     "atr_pct": 4.25,
     "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-04-29"
+    "atr_last_calc": "2026-04-29",
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 25
+      }
+    ],
+    "last_signal": "SELL"
   },
   "NIO": {
     "shares": 38.0,
@@ -43,7 +57,14 @@
     "atr_pct": 4.6,
     "atr_stop_pct": -10.0,
     "atr_last_calc": "2026-04-29",
-    "tightened_stop_price": 7.11
+    "tightened_stop_price": 7.11,
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 38
+      }
+    ],
+    "last_signal": "SELL"
   },
   "NVDA": {
     "shares": 3.0,
@@ -59,7 +80,14 @@
     "tightened_stop": false,
     "atr_pct": 2.68,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29"
+    "atr_last_calc": "2026-04-29",
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 82
+      }
+    ],
+    "last_signal": "STRONG BUY"
   },
   "SCHW": {
     "shares": 4.0,
@@ -74,7 +102,14 @@
     "tightened_stop": false,
     "atr_pct": 3.19,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29"
+    "atr_last_calc": "2026-04-29",
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 25
+      }
+    ],
+    "last_signal": "SELL"
   },
   "AVGO": {
     "shares": 2.0,
@@ -89,6 +124,13 @@
     "tightened_stop": false,
     "atr_pct": 3.2,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29"
+    "atr_last_calc": "2026-04-29",
+    "score_history": [
+      {
+        "date": "2026-04-29",
+        "score": 65
+      }
+    ],
+    "last_signal": "BUY"
   }
 }

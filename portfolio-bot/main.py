@@ -6,7 +6,7 @@ Commands you can send the bot:
   /trim TICKER               sell 50% of a position (quick partial exit)
   /portfolio                 unified daily view — every position + signal
   /deep TICKER               full momentum analysis on any single stock
-  /monthly                   run the monthly S&P 500 buy screen
+  /monthly                   run the monthly S&P 500 + Nasdaq 100 buy screen
   /earnings                  list upcoming earnings (next 30 days)
   /health                    portfolio health score (0–10) with breakdown
 
@@ -678,15 +678,89 @@ def get_current_price(ticker):
 
 
 def get_sp500_tickers():
-    """Return the first 100 S&P 500 tickers from a public dataset."""
+    """Return ALL S&P 500 tickers from the canonical public dataset CSV.
+
+    Also used by ``find_replacement_after_exit`` (top-100 slice) and as one
+    half of ``get_screening_universe``.
+    """
     url = (
         "https://raw.githubusercontent.com/datasets/"
         "s-and-p-500-companies/main/data/constituents.csv"
     )
-    response = urllib.request.urlopen(url)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    response = urllib.request.urlopen(req, timeout=20)
     lines = response.read().decode().split("\n")[1:]
-    tickers = [line.split(",")[0] for line in lines if line.strip()]
-    return tickers[:100]
+    tickers = [line.split(",")[0].strip() for line in lines if line.strip()]
+    return [t for t in tickers if re.match(r"^[A-Z]{1,5}$", t)]
+
+
+def get_nasdaq100_tickers():
+    """Return Nasdaq-100 tickers scraped from the Wikipedia constituents table.
+
+    The table is table index 4 on the Nasdaq-100 Wikipedia page.  First cell
+    of each data row is the ticker symbol.  Retried once on transient failure.
+    """
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    for attempt in range(2):
+        try:
+            html = urllib.request.urlopen(req, timeout=20).read().decode(
+                "utf-8", errors="replace"
+            )
+            tables = re.findall(
+                r"<table[^>]*wikitable[^>]*>(.*?)</table>", html, re.DOTALL
+            )
+            # Table 4 (0-indexed) is the 100-component constituents list.
+            if len(tables) < 5:
+                raise ValueError(
+                    f"Expected ≥5 wikitables on Nasdaq-100 page, found {len(tables)}"
+                )
+            t = tables[4]
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", t, re.DOTALL)
+            tickers = []
+            for row in rows[1:]:   # skip header row
+                m = re.search(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+                if m:
+                    raw = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                    if re.match(r"^[A-Z]{1,5}$", raw):
+                        tickers.append(raw)
+            if tickers:
+                return tickers
+        except Exception as exc:
+            print(f"[nasdaq100] attempt {attempt + 1} failed: {exc}")
+    return []
+
+
+def get_screening_universe():
+    """Combine S&P 500 + Nasdaq 100, deduplicate, and return with stats.
+
+    Returns:
+        (tickers, sp500_count, ndq100_count, overlap_count)
+
+    Falls back gracefully if one list is unavailable — the universe will just
+    contain whichever list succeeded.
+    """
+    sp500: list[str] = []
+    ndq100: list[str] = []
+
+    try:
+        sp500 = get_sp500_tickers()
+        print(f"[universe] S&P 500: {len(sp500)} tickers")
+    except Exception as exc:
+        print(f"[universe] S&P 500 fetch failed: {exc}")
+
+    try:
+        ndq100 = get_nasdaq100_tickers()
+        print(f"[universe] Nasdaq 100: {len(ndq100)} tickers")
+    except Exception as exc:
+        print(f"[universe] Nasdaq 100 fetch failed: {exc}")
+
+    sp500_set = set(sp500)
+    ndq100_set = set(ndq100)
+    overlap = sp500_set & ndq100_set
+    combined = list(dict.fromkeys(sp500 + [t for t in ndq100 if t not in sp500_set]))
+
+    return combined, len(sp500), len(ndq100), len(overlap)
 
 
 # Field set we care about from yfinance Ticker.info
@@ -1873,22 +1947,30 @@ def run_monthly_screen(chat_id):
     """Monthly buy screen — fundamental filter then momentum ranking.
 
     Pipeline:
-      1. Pull fundamentals for the full S&P 500 (one bulk parallel fetch).
-      2. Apply the hard fundamental filters via ``passes_buy_screen`` —
+      1. Build the screening universe: all S&P 500 + Nasdaq 100, deduplicated.
+      2. Pull fundamentals for every unique ticker (one bulk parallel fetch).
+      3. Apply the hard fundamental filters via ``passes_buy_screen`` —
          this only rejects bad companies, it does NOT score them.
-      3. Score every survivor with ``score_momentum_bulk`` and rank.
-      4. Pick the top 2 with score ≥ 65; if none qualify, send the
+      4. Score every survivor with ``score_momentum_bulk`` and rank.
+      5. Pick the top 2 with score ≥ 65; if none qualify, send the
          "no strong momentum opportunities — hold cash" message.
-      5. Log each pick to the rec log with ``momentum_score_at_recommendation``.
+      6. Log each pick to the rec log with ``momentum_score_at_recommendation``.
     The Claude 5-pillar framework call is no longer used here.
     """
     send_telegram(
-        "*Running monthly S&P 500 buy screen...*\n"
-        "Fundamental filter + momentum ranking. This takes 2-4 minutes.",
+        "*Running monthly S&P 500 + Nasdaq 100 buy screen...*\n"
+        "Building universe, applying fundamental filter + momentum ranking. "
+        "This takes 3-6 minutes.",
         chat_id,
     )
 
-    tickers = get_sp500_tickers()
+    tickers, sp500_n, ndq100_n, overlap_n = get_screening_universe()
+    universe_line = (
+        f"Screened {len(tickers)} stocks "
+        f"({sp500_n} S&P 500 + {ndq100_n} Nasdaq 100 − {overlap_n} overlap)"
+    )
+    print(f"[monthly] {universe_line}")
+
     fundamentals_map = fetch_fundamentals_bulk(tickers)
     print(
         f"[monthly] fetched fundamentals for {len(fundamentals_map)}"
@@ -1904,7 +1986,8 @@ def run_monthly_screen(chat_id):
     )
     if not basic_candidates:
         send_telegram(
-            "No S&P 500 stocks passed the fundamental filter this month.",
+            f"*Monthly Buy Screen*\n_{universe_line}_\n\n"
+            "No stocks passed the fundamental filter this month.",
             chat_id,
         )
         return
@@ -1961,6 +2044,7 @@ def run_monthly_screen(chat_id):
         top_score = ranked[0][1] if ranked else 0
         send_telegram(
             f"*Monthly Buy Screen*\n"
+            f"_{universe_line}_\n"
             f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
             f"fundamental filter._\n\n"
             f"No strong momentum opportunities this month — hold cash.\n"
@@ -1972,6 +2056,7 @@ def run_monthly_screen(chat_id):
 
     header = (
         f"*Monthly Buy Screen*\n"
+        f"_{universe_line}_\n"
         f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
         f"fundamental filter._\n"
         f"_{len(qualifying)} of {len(momentum_map)} scored above 65 (BUY).  "
@@ -3689,7 +3774,7 @@ def handle_start(chat_id):
         "`/health` — portfolio health score (0–10) + sector breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
         "`/deep TICKER` — full momentum analysis on any stock\n"
-        "`/monthly` — monthly S&P 500 buy screen (top 2 picks)\n"
+        "`/monthly` — monthly S&P 500 + Nasdaq 100 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
         "`/performance` — track record vs S&P 500\n\n"
         "_Hard SELL rules:_\n"
