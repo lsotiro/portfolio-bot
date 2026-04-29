@@ -515,7 +515,7 @@ def _port_is_free(port):
         s.close()
 
 
-def pick_dashboard_port(preferred=8080):
+def pick_dashboard_port(preferred=8082):
     """Return the first free port from the candidate list.
 
     8081 is skipped because in this Replit environment it is mapped to

@@ -153,19 +153,139 @@ NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
 
 
 # ---------------------------------------------------------------------------
-# Flask keep-alive web server
+# Flask web server — portfolio summary page + uptime ping
+# Runs on port 8080 so the Replit proxy can reach it at the root path.
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
 
+@app.route("/ping")
+def ping():
+    """Uptime-monitoring endpoint — always returns 200 OK."""
+    return "OK", 200
+
+
 @app.route("/")
 def home():
-    return "Bot is running"
+    """Simple portfolio summary page — reads portfolio.json and cash.json
+    directly so the page loads fast without any yfinance calls."""
+    try:
+        portfolio = load_portfolio()
+        cash_data = load_cash()
+        cash = float(cash_data.get("cash", 0.0))
+    except Exception:
+        portfolio = {}
+        cash = 0.0
+
+    rows = []
+    total_cost = 0.0
+    for ticker, pos in portfolio.items():
+        shares = pos.get("shares", 0)
+        entry = pos.get("entry_price", 0)
+        cost = shares * entry
+        total_cost += cost
+        peak = pos.get("peak_price") or entry
+        atr_pct = pos.get("atr_stop_pct", -7)
+        stop = round(peak * (1 + atr_pct / 100), 2)
+        score = pos.get("momentum_score")
+        score_str = f"{score}/100" if score is not None else "—"
+        sector = pos.get("sector") or "—"
+        rows.append((ticker, shares, entry, cost, peak, stop, score_str, sector))
+
+    total_value = total_cost + cash
+    num_pos = len(portfolio)
+
+    table_rows = "".join(
+        f"<tr>"
+        f"<td><b>{t}</b></td>"
+        f"<td>{sh:.4g}</td>"
+        f"<td>${ep:.2f}</td>"
+        f"<td>${cos:.2f}</td>"
+        f"<td>${pk:.2f}</td>"
+        f"<td>${st:.2f}</td>"
+        f"<td>{sc}</td>"
+        f"<td>{sec}</td>"
+        f"</tr>"
+        for t, sh, ep, cos, pk, st, sc, sec in rows
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Portfolio Bot</title>
+<style>
+  body {{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;
+         margin:0;padding:24px}}
+  h1 {{color:#38bdf8;margin:0 0 4px}}
+  .sub {{color:#94a3b8;font-size:.85rem;margin-bottom:24px}}
+  .cards {{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}}
+  .card {{background:#1e293b;border-radius:8px;padding:16px 24px;min-width:140px}}
+  .card-label {{color:#94a3b8;font-size:.75rem;text-transform:uppercase;
+                letter-spacing:.05em}}
+  .card-value {{font-size:1.5rem;font-weight:700;color:#f8fafc;margin-top:4px}}
+  table {{width:100%;border-collapse:collapse;background:#1e293b;
+          border-radius:8px;overflow:hidden}}
+  th {{background:#0f172a;color:#94a3b8;font-size:.75rem;text-transform:uppercase;
+       letter-spacing:.05em;padding:10px 14px;text-align:left}}
+  td {{padding:10px 14px;border-top:1px solid #1e3a5f;font-size:.9rem}}
+  tr:hover td {{background:#263548}}
+  .ping {{position:fixed;bottom:12px;right:16px;color:#475569;font-size:.7rem}}
+</style>
+</head>
+<body>
+<h1>📈 Portfolio Bot</h1>
+<p class="sub">Auto-refreshes every 60 s &nbsp;·&nbsp;
+  Prices shown are entry prices — run /portfolio in Telegram for live data</p>
+<div class="cards">
+  <div class="card">
+    <div class="card-label">Positions</div>
+    <div class="card-value">{num_pos}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Cost Basis</div>
+    <div class="card-value">${total_cost:,.2f}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Idle Cash</div>
+    <div class="card-value">${cash:,.2f}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Total Value</div>
+    <div class="card-value">${total_value:,.2f}</div>
+  </div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Ticker</th><th>Shares</th><th>Entry</th><th>Cost</th>
+      <th>Peak</th><th>Stop</th><th>Score</th><th>Sector</th>
+    </tr>
+  </thead>
+  <tbody>{table_rows if table_rows else
+    '<tr><td colspan="8" style="text-align:center;color:#475569">No positions</td></tr>'
+  }</tbody>
+</table>
+<div class="ping">
+  <a href="/ping" style="color:#475569">/ping</a>
+</div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 def keep_alive():
-    """Run the Flask server. Started in a background thread."""
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    """Run the Flask server. Started in a background thread.
+
+    Port selection (in priority order):
+      1. PORT env var (set by Replit workflow config)
+      2. 5000 (default / fallback)
+    """
+    port = int(os.environ.get("PORT", 5000))
+    print(f"[web] portfolio summary server starting on port {port}")
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 # ---------------------------------------------------------------------------
@@ -4436,19 +4556,41 @@ schedule.every().day.at("09:00", "UTC").do(scheduled_run)
 # Boot everything (only when run as a script, NOT when imported)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    Thread(target=keep_alive, daemon=True).start()
-    Thread(target=poll_telegram, daemon=True).start()
+    # ── Thread 1: Flask web server (portfolio summary + /ping) on port 8080
+    t_web = Thread(target=keep_alive, daemon=True, name="web-server")
+    t_web.start()
 
-    # Web dashboard — separate Flask app, runs in its own thread so it
-    # doesn't block the bot. Tries port 8080 first, falls back to the
-    # next free port if 8080 is taken by another artifact. Imported
-    # here (rather than at module top) so dashboard.py can lazily
-    # import from this module without a circular dependency.
-    from dashboard import start_dashboard
-    Thread(target=start_dashboard, daemon=True).start()
+    # ── Thread 2: Telegram long-poll loop
+    t_bot = Thread(target=poll_telegram, daemon=True, name="telegram-poll")
+    t_bot.start()
 
-    print("Portfolio Bot started. Unified /portfolio view scheduled at "
-          "09:00 UTC daily.")
+    # ── Thread 3 (optional): extended web dashboard on port 8082.
+    # Imported here so dashboard.py's lazy `from main import …` resolves
+    # to the already-running module without double-executing this script.
+    try:
+        from dashboard import start_dashboard
+        t_dash = Thread(target=start_dashboard, daemon=True, name="dashboard")
+        t_dash.start()
+        dash_status = "starting on port 8082"
+    except Exception as _e:
+        print(f"[boot] dashboard skipped: {_e}")
+        dash_status = "skipped"
+
+    _web_port = int(os.environ.get("PORT", 5000))
+    print(
+        "\n"
+        "┌─────────────────────────────────────────────────┐\n"
+        "│           Portfolio Bot — STARTED               │\n"
+        "├─────────────────────────────────────────────────┤\n"
+        f"│  Web server  : http://0.0.0.0:{_web_port}               │\n"
+        f"│  /ping       : http://0.0.0.0:{_web_port}/ping          │\n"
+        f"│  Telegram    : polling …                        │\n"
+        f"│  Dashboard   : {dash_status:<33} │\n"
+        "│  Scheduler   : 08:00/08:30/09:00 UTC jobs       │\n"
+        "└─────────────────────────────────────────────────┘\n"
+    )
+
+    # ── Main thread: run the schedule loop indefinitely
     while True:
         schedule.run_pending()
         time.sleep(30)
