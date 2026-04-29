@@ -1147,6 +1147,98 @@ def passes_buy_screen(f):
     )
 
 
+def check_buy_disqualifiers(ticker, score, details, fundamentals):
+    """Return a list of hard disqualification reasons for a BUY recommendation.
+
+    Each item is a dict with keys:
+      label   – short machine label
+      reason  – human-readable disqualification line
+      fix     – what would need to change for the stock to qualify
+      entry   – suggested entry price string (only for OVEREXTENDED rule)
+
+    An empty list means the stock is clean to recommend.
+    """
+    disqualifiers = []
+
+    current_px = (fundamentals or {}).get("currentPrice")
+    target_px = _safe_target((fundamentals or {}).get("targetMeanPrice"))
+    ret_4w = details.get("ret_4w")          # already in percent (e.g. 38.5)
+    estimates_rising = details.get("estimates_rising")
+    rvol = details.get("rvol")
+
+    # ── Rule 1: near/above analyst target ────────────────────────────────────
+    if current_px and target_px:
+        upside_pct = (target_px - current_px) / current_px * 100
+        if upside_pct < 5.0:
+            fix_px = target_px * 0.90  # need target to be >5% above price
+            disqualifiers.append({
+                "label": "EXTENDED",
+                "reason": (
+                    f"EXTENDED — no upside to target  "
+                    f"(current ${current_px:.2f}, target ${target_px:.2f}, "
+                    f"upside {upside_pct:.1f}%)"
+                ),
+                "fix": (
+                    f"Price would need to pull back below ~${fix_px:.2f} "
+                    f"to restore 10%+ upside, or analysts raise target."
+                ),
+                "entry": None,
+            })
+
+    # ── Rule 2: deteriorating earnings estimates ──────────────────────────────
+    if estimates_rising is False:
+        disqualifiers.append({
+            "label": "DETERIORATING_ESTIMATES",
+            "reason": "DETERIORATING ESTIMATES — earnings revisions are negative",
+            "fix": "Wait for analyst estimate revisions to turn positive.",
+            "entry": None,
+        })
+
+    # ── Rule 3: low relative volume ───────────────────────────────────────────
+    if rvol is not None and rvol < 0.5:
+        disqualifiers.append({
+            "label": "LOW_CONVICTION",
+            "reason": f"LOW CONVICTION — weak volume (RVOL {rvol:.2f}, need ≥ 0.5)",
+            "fix": "Wait for volume to confirm the move (RVOL above 0.5 on an up-day).",
+            "entry": None,
+        })
+
+    # ── Rule 4: extended after a big run (4-week return > 35%) ───────────────
+    if ret_4w is not None and ret_4w > 35.0:
+        if current_px:
+            lo_entry = current_px * 0.85
+            hi_entry = current_px * 0.90
+            entry_str = f"${lo_entry:.2f} – ${hi_entry:.2f}"
+        else:
+            entry_str = "10–15% below current"
+        disqualifiers.append({
+            "label": "OVEREXTENDED",
+            "reason": (
+                f"OVEREXTENDED — up {ret_4w:.1f}% in 4 weeks; "
+                "wait for a pullback"
+            ),
+            "fix": (
+                f"Wait for the stock to consolidate. "
+                f"Suggested entry zone: {entry_str} (−10–15%)."
+            ),
+            "entry": entry_str,
+        })
+
+    return disqualifiers
+
+
+def format_buy_disqualifier_block(ticker, score, dqs):
+    """Render a ⚠️ DISQUALIFIED block for Telegram (plain text)."""
+    lines = [f"⚠️ {ticker} — DISQUALIFIED  (Score {score}/100)"]
+    for dq in dqs:
+        lines.append(f"  ✗ {dq['reason']}")
+    lines.append("")
+    lines.append("What would need to change:")
+    for dq in dqs:
+        lines.append(f"  • {dq['fix']}")
+    return "\n".join(lines)
+
+
 def format_fund(value, suffix=""):
     """Pretty-print a fundamental value (or 'n/a')."""
     if value is None:
@@ -2038,9 +2130,21 @@ def run_monthly_screen(chat_id):
         reverse=True,
     )
     qualifying = [r for r in ranked if r[1] >= 65]
-    picks = qualifying[:2]
 
-    if not picks:
+    # Apply hard disqualification rules — clean picks go to BUY section,
+    # disqualified ones are shown separately with reasons.
+    picks = []
+    disqualified_entries = []   # list of (ticker, score, details, dq_list)
+    for t, s, d in qualifying:
+        fund = cand_fundamentals.get(t, {}) or {}
+        dqs = check_buy_disqualifiers(t, s, d, fund)
+        if dqs:
+            disqualified_entries.append((t, s, d, dqs))
+        else:
+            if len(picks) < 2:
+                picks.append((t, s, d))
+
+    if not picks and not disqualified_entries:
         top_score = ranked[0][1] if ranked else 0
         send_telegram(
             f"*Monthly Buy Screen*\n"
@@ -2054,17 +2158,31 @@ def run_monthly_screen(chat_id):
         )
         return
 
-    header = (
-        f"*Monthly Buy Screen*\n"
-        f"_{universe_line}_\n"
-        f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
-        f"fundamental filter._\n"
-        f"_{len(qualifying)} of {len(momentum_map)} scored above 65 (BUY).  "
-        f"Top {len(picks)} below._\n"
+    dq_note = (
+        f"  {len(disqualified_entries)} disqualified by hard rules."
+        if disqualified_entries else ""
     )
+    if picks:
+        header = (
+            f"*Monthly Buy Screen*\n"
+            f"_{universe_line}_\n"
+            f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
+            f"fundamental filter._\n"
+            f"_{len(qualifying)} scored ≥ 65.  "
+            f"Top {len(picks)} clean pick(s) below.{dq_note}_\n"
+        )
+    else:
+        header = (
+            f"*Monthly Buy Screen*\n"
+            f"_{universe_line}_\n"
+            f"_{len(basic_candidates)} of {len(fundamentals_map)} passed the "
+            f"fundamental filter._\n"
+            f"_{len(qualifying)} scored ≥ 65 but all were disqualified by hard rules._\n"
+            f"_Hold cash — no clean BUY candidates this month._\n"
+        )
     send_telegram(header, chat_id)
 
-    # One Telegram message per pick with the full momentum breakdown.
+    # One Telegram message per clean pick with the full momentum breakdown.
     parsed_for_log = []
     for t, score, d in picks:
         signal, color = get_momentum_signal(score)
@@ -2102,6 +2220,14 @@ def run_monthly_screen(chat_id):
             "bull_case": None,
             "bear_case": None,
         })
+
+    # Disqualified section — show as a single grouped message.
+    if disqualified_entries:
+        dq_lines = ["⚠️ DISQUALIFIED — scored ≥ 65 but failed hard rules:\n"]
+        for t, s, d, dqs in disqualified_entries[:5]:  # cap at 5 shown
+            dq_lines.append(format_buy_disqualifier_block(t, s, dqs))
+            dq_lines.append("")
+        send_telegram("\n".join(dq_lines).strip(), chat_id, parse_mode=None)
 
     # Feedback loop — log every monthly pick so we can grade it later.
     try:
@@ -3694,16 +3820,6 @@ def handle_deep(args, chat_id):
             current_px = (info or {}).get("currentPrice")
             target = _safe_target((info or {}).get("targetMeanPrice"))
 
-            # Reuse the same Claude reasoning helper used by /portfolio so
-            # the wording stays consistent across commands.
-            reasons = _get_quick_reasons([{
-                "ticker": ticker, "signal": signal, "color": color,
-                "score": score, "details": details,
-            }])
-            reason = reasons.get(
-                ticker, _fallback_reason(signal, score)
-            )
-
             d = details
             target_line = (
                 f"Analyst target: ${target:.2f}" if target else "Analyst target: n/a"
@@ -3712,8 +3828,8 @@ def handle_deep(args, chat_id):
                 f"Current price: ${current_px:.2f}" if current_px else "Current price: n/a"
             )
 
-            send_telegram(
-                f"{color} {ticker} — {signal}\n"
+            # Build the base stats block (shown regardless of DQ status).
+            stats_block = (
                 f"Momentum Score: {score}/100\n"
                 f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
                 f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
@@ -3725,11 +3841,39 @@ def handle_deep(args, chat_id):
                 f"News: {d.get('news', 'n/a')}\n"
                 f"Earnings: "
                 f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
-                f"{current_line} | {target_line}\n"
-                f"{reason}",
-                chat_id,
-                parse_mode=None,
+                f"{current_line} | {target_line}"
             )
+
+            # Hard disqualification check — overrides BUY signal.
+            dqs = check_buy_disqualifiers(ticker, score, details, info or {})
+
+            if dqs and signal in ("BUY", "STRONG BUY"):
+                # Show stats first, then the disqualification block.
+                send_telegram(
+                    f"📊 {ticker} — Deep Analysis\n{stats_block}",
+                    chat_id,
+                    parse_mode=None,
+                )
+                dq_msg = (
+                    f"\n{format_buy_disqualifier_block(ticker, score, dqs)}\n\n"
+                    f"Despite a {score}/100 momentum score, {ticker} does NOT "
+                    f"qualify as a BUY due to the rule(s) above."
+                )
+                send_telegram(dq_msg, chat_id, parse_mode=None)
+            else:
+                # Clean — show normal signal with reasoning.
+                reasons = _get_quick_reasons([{
+                    "ticker": ticker, "signal": signal, "color": color,
+                    "score": score, "details": details,
+                }])
+                reason = reasons.get(ticker, _fallback_reason(signal, score))
+                send_telegram(
+                    f"{color} {ticker} — {signal}\n"
+                    f"{stats_block}\n"
+                    f"{reason}",
+                    chat_id,
+                    parse_mode=None,
+                )
 
             # Feedback loop — log this on-demand recommendation with the
             # momentum score (no claude_target / stop_loss available from

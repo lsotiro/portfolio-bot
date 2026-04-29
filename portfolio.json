@@ -1,50 +1,4 @@
 {
-  "CRM": {
-    "shares": 2.0,
-    "entry_price": 263.42,
-    "added": "2026-04-28T14:39:58",
-    "analyst_target": 268.8725,
-    "approach_alerted": false,
-    "above_alerted": false,
-    "momentum_score": 35,
-    "peak_price": 263.42,
-    "sector": "Technology",
-    "tightened_stop": true,
-    "atr_pct": 4.33,
-    "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-04-29",
-    "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 35
-      }
-    ],
-    "last_signal": "SELL",
-    "tightened_stop_price": 237.08
-  },
-  "ADSK": {
-    "shares": 2.0,
-    "entry_price": 305.93,
-    "added": "2026-04-28T14:42:22",
-    "analyst_target": 325.54843,
-    "approach_alerted": false,
-    "above_alerted": false,
-    "momentum_score": 35,
-    "peak_price": 305.93,
-    "sector": "Technology",
-    "tightened_stop": true,
-    "atr_pct": 4.25,
-    "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-04-29",
-    "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 35
-      }
-    ],
-    "last_signal": "SELL",
-    "tightened_stop_price": 275.34
-  },
   "NIO": {
     "shares": 38.0,
     "entry_price": 7.9,
@@ -122,7 +76,7 @@
     "approach_alerted": false,
     "above_alerted": false,
     "momentum_score": 65,
-    "peak_price": 400.4,
+    "peak_price": 400.525,
     "sector": "Technology",
     "tightened_stop": false,
     "atr_pct": 3.2,
