@@ -6,20 +6,21 @@
     "analyst_target": 268.8725,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 25,
+    "momentum_score": 35,
     "peak_price": 263.42,
     "sector": "Technology",
-    "tightened_stop": false,
+    "tightened_stop": true,
     "atr_pct": 4.33,
     "atr_stop_pct": -10.0,
     "atr_last_calc": "2026-04-29",
     "score_history": [
       {
         "date": "2026-04-29",
-        "score": 25
+        "score": 35
       }
     ],
-    "last_signal": "SELL"
+    "last_signal": "SELL",
+    "tightened_stop_price": 237.08
   },
   "ADSK": {
     "shares": 2.0,
@@ -28,20 +29,21 @@
     "analyst_target": 325.54843,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 25,
+    "momentum_score": 35,
     "peak_price": 305.93,
     "sector": "Technology",
-    "tightened_stop": false,
+    "tightened_stop": true,
     "atr_pct": 4.25,
     "atr_stop_pct": -10.0,
     "atr_last_calc": "2026-04-29",
     "score_history": [
       {
         "date": "2026-04-29",
-        "score": 25
+        "score": 35
       }
     ],
-    "last_signal": "SELL"
+    "last_signal": "SELL",
+    "tightened_stop_price": 275.34
   },
   "NIO": {
     "shares": 38.0,
@@ -50,7 +52,7 @@
     "analyst_target": 6.661333,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 38,
+    "momentum_score": 48,
     "peak_price": 7.9,
     "sector": "Consumer Cyclical",
     "tightened_stop": true,
@@ -61,7 +63,7 @@
     "score_history": [
       {
         "date": "2026-04-29",
-        "score": 38
+        "score": 48
       }
     ],
     "last_signal": "SELL"
@@ -74,7 +76,7 @@
     "analyst_target": 268.6148,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 82,
+    "momentum_score": 75,
     "peak_price": 213.17,
     "sector": "Technology",
     "tightened_stop": false,
@@ -84,10 +86,10 @@
     "score_history": [
       {
         "date": "2026-04-29",
-        "score": 82
+        "score": 75
       }
     ],
-    "last_signal": "STRONG BUY"
+    "last_signal": "BUY"
   },
   "SCHW": {
     "shares": 4.0,
@@ -96,20 +98,21 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 25,
+    "momentum_score": 35,
     "peak_price": 90.84,
     "sector": "Financial Services",
-    "tightened_stop": false,
+    "tightened_stop": true,
     "atr_pct": 3.19,
     "atr_stop_pct": -7.0,
     "atr_last_calc": "2026-04-29",
     "score_history": [
       {
         "date": "2026-04-29",
-        "score": 25
+        "score": 35
       }
     ],
-    "last_signal": "SELL"
+    "last_signal": "WATCH",
+    "tightened_stop_price": 87.97
   },
   "AVGO": {
     "shares": 2.0,
@@ -119,7 +122,7 @@
     "approach_alerted": false,
     "above_alerted": false,
     "momentum_score": 65,
-    "peak_price": 399.83,
+    "peak_price": 400.4,
     "sector": "Technology",
     "tightened_stop": false,
     "atr_pct": 3.2,
