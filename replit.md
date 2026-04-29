@@ -56,6 +56,44 @@ of the momentum score so SELL fires on EITHER trigger:
 | Score 35–50 AND  price above stop                  | WATCH 🟡      |
 | Score `None` (insufficient history)                | WATCH 🟡      |
 
+### Signal confirmation (anti-flipping)
+Raw SELL signals from momentum are filtered by `handle_portfolio` before
+being sent or displayed:
+
+| Trigger                                  | Result                                |
+|------------------------------------------|---------------------------------------|
+| Trailing stop breached                   | SELL fires immediately (no confirmation) |
+| Score < 35 for **2 consecutive days**    | SELL confirmed                        |
+| Score dropped **> 30 pts** in one day    | SELL confirmed (dramatic collapse)    |
+| Score < 35 on day 1 only                 | Downgraded to **WATCH** (unconfirmed) |
+
+**Monthly-screen buy protection** (~5 trading days = 7 calendar days):
+When a stock is bought after a monthly screen recommendation, a second gate
+applies for the first 7 calendar days:
+- Trailing stop breach → SELL fires
+- 2 consecutive days < 35 → SELL fires
+- Dramatic drop only → downgraded to WATCH with protection note
+
+### Signal stability indicator
+Every `/portfolio` report shows per-position:
+- **Stable** — same signal as yesterday
+- **Changing ⚠️** — different from yesterday, both scores shown side-by-side
+
+### Score history (`score_history`)
+Rolling 5-entry list `[{"date": "YYYY-MM-DD", "score": N}]` stored per
+position in `portfolio.json`. Updated every time `handle_portfolio` runs.
+
+### Monthly-screen sell filter (`signal_log.json`)
+When a confirmed SELL is logged by the scheduled 09:00 run, the ticker is
+stamped in `signal_log.json`. The monthly screen filters out any ticker that
+had a SELL signal within the last 7 days before recommending it as a BUY.
+
+### Monthly picks (`monthly_picks.json`)
+`run_monthly_screen` records every pick to `{ticker: ISO-date}`. When the
+user runs `/buy` on a ticker that was monthly-recommended within the last
+30 days, the position is stamped with `monthly_buy_date` and gets the
+5-day SELL-suppression protection.
+
 `apply_position_rules(score, current, stop_price)` now takes the
 **precomputed trailing stop price** so the caller (always
 `compute_trailing_stop`) decides whether the stop is peak-based,

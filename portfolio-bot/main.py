@@ -18,11 +18,12 @@ Signal engine — 100-point momentum score per stock:
 Daily schedule (UTC):
   08:00 — earnings calendar sweep (alerts for earnings ≤ 3 days away)
   08:30 — morning portfolio health score push
-  09:00 — unified /portfolio momentum review. Sends an immediate SELL
-          alert for any position whose score crosses below 35, and a
-          WARNING alert for any position whose score dropped > 20 pts
-          vs yesterday (yesterday's score is persisted on each position
-          in portfolio.json).
+  09:00 — unified /portfolio momentum review. Sends a confirmed SELL
+          alert (score < 35 for 2 consecutive days OR >30-pt collapse),
+          suppresses SELL for stocks within the 5-day monthly-screen
+          protection window, and shows a Signal stability indicator
+          (Stable / Changing) per position. Score history (last 5 days)
+          is stored per position in portfolio.json.
 
 Fundamentals are now used ONLY as a filter for the monthly buy screen
 (rev growth > 10%, profit margin > 0, D/E < 100, fwd PE < 40 etc.) — they
@@ -84,6 +85,14 @@ CASH_FILE = "cash.json"
 # market settle a bit if the exit was triggered intraday).
 RESCAN_DELAY_SECONDS = 300        # 5 minutes
 
+# Signal confirmation — prevents daily flipping on momentum signals.
+SCORE_HISTORY_DAYS = 5             # rolling window of daily scores kept per position
+SELL_CONFIRM_DROP = 30             # score drops > 30 pts in one day → confirm immediately
+MONTHLY_BUY_PROTECTION_CAL_DAYS = 7  # ≈5 trading days: suppress non-stop SELL after
+                                      # a stock is recommended by the monthly screen
+SELL_SIGNAL_BLACKOUT_DAYS = 7     # days to exclude a ticker from the monthly
+                                   # BUY screen after it generated a SELL signal
+
 
 def _status_emoji(pl_pct):
     """Three-state P&L emoji.
@@ -144,6 +153,8 @@ ALPHA_VANTAGE_MIN_INTERVAL_SEC = 13.0
 PORTFOLIO_FILE = "portfolio.json"   # where positions are stored
 LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
 RECS_LOG_FILE = "recommendations_log.json"   # feedback-loop history
+MONTHLY_PICKS_FILE = "monthly_picks.json"    # {ticker: ISO-date} of last monthly rec
+SIGNAL_LOG_FILE = "signal_log.json"          # {ticker: last_sell_signal_date} log
 
 # Review windows for recommendation tracking (calendar days).
 REVIEW_4W_DAYS = 28
@@ -508,6 +519,124 @@ def compute_trailing_stop(pos, current_price=None):
 
 def save_portfolio(portfolio):
     save_json(PORTFOLIO_FILE, portfolio)
+
+
+# ---------------------------------------------------------------------------
+# Signal-log helpers — persist SELL signals so the monthly screen can
+# avoid re-recommending a stock that just generated a SELL.
+# ---------------------------------------------------------------------------
+def load_signal_log():
+    return load_json(SIGNAL_LOG_FILE, {})
+
+
+def save_signal_log(log):
+    save_json(SIGNAL_LOG_FILE, log)
+
+
+def record_sell_signal(ticker, date_iso):
+    """Stamp ticker with the latest SELL-signal date in signal_log.json."""
+    try:
+        log = load_signal_log()
+        log[ticker] = {"last_sell_signal_date": date_iso}
+        save_signal_log(log)
+    except Exception as exc:
+        print(f"[signal-log] failed to record SELL for {ticker}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Monthly-picks helpers — track which tickers the monthly screen
+# recommended so /buy can grant them the 5-day SELL-protection window.
+# ---------------------------------------------------------------------------
+def load_monthly_picks():
+    return load_json(MONTHLY_PICKS_FILE, {})
+
+
+def save_monthly_picks(picks):
+    save_json(MONTHLY_PICKS_FILE, picks)
+
+
+# ---------------------------------------------------------------------------
+# Score-history helpers — rolling 5-day window per position.
+# ---------------------------------------------------------------------------
+def _update_score_history(pos, score, today_iso):
+    """Append today's score to pos['score_history']; keep last SCORE_HISTORY_DAYS."""
+    if score is None:
+        return
+    history = pos.get("score_history") or []
+    # Avoid duplicate entry for today.
+    if history and history[-1].get("date") == today_iso:
+        history[-1]["score"] = score
+    else:
+        history.append({"date": today_iso, "score": score})
+    pos["score_history"] = history[-SCORE_HISTORY_DAYS:]
+
+
+# ---------------------------------------------------------------------------
+# Signal-confirmation helpers — prevent daily flipping.
+# ---------------------------------------------------------------------------
+def _cal_days_since(date_str):
+    """Calendar days since an ISO date string. Returns 9999 on any error."""
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        return max(0, (datetime.utcnow().date() - d).days)
+    except Exception:
+        return 9999
+
+
+def _is_confirmed_sell(score, pos):
+    """Return True if a momentum-based SELL (score < 35) is confirmed.
+
+    Confirmation rules (OR logic — any one is sufficient):
+      1. Dramatic collapse: score dropped > SELL_CONFIRM_DROP points since
+         the previous stored score.
+      2. Two consecutive sub-35 days: previous stored score was also < 35.
+
+    A stop-loss breach is always immediate and never needs confirmation —
+    the caller handles that case before reaching here.
+    """
+    if score is None or score >= 35:
+        return False
+
+    prev_score = pos.get("momentum_score")
+    if prev_score is None:
+        # No baseline yet — don't confirm on first observation.
+        return False
+
+    # Rule 1: dramatic single-day collapse.
+    if (prev_score - score) > SELL_CONFIRM_DROP:
+        return True
+
+    # Rule 2: second consecutive sub-35 day.
+    if prev_score < 35:
+        return True
+
+    return False
+
+
+def _in_monthly_buy_protection(pos):
+    """Return True if this position is within the monthly-screen buy
+    protection window (≈5 trading days ≈ MONTHLY_BUY_PROTECTION_CAL_DAYS
+    calendar days). During this window non-stop SELL signals are suppressed.
+    """
+    date_str = pos.get("monthly_buy_date")
+    if not date_str:
+        return False
+    return _cal_days_since(date_str) < MONTHLY_BUY_PROTECTION_CAL_DAYS
+
+
+def _derive_signal_from_score(score):
+    """Derive the named signal string from a raw momentum score."""
+    if score is None:
+        return "WATCH"
+    if score >= 80:
+        return "STRONG BUY"
+    if score >= 65:
+        return "BUY"
+    if score >= 50:
+        return "HOLD"
+    if score >= 35:
+        return "WATCH"
+    return "SELL"
 
 
 def remember_chat(chat_id):
@@ -1798,6 +1927,27 @@ def run_monthly_screen(chat_id):
     )
     print(f"[monthly] scored momentum for {len(momentum_map)} candidates")
 
+    # ── Filter: exclude tickers with a SELL signal in the last 7 days ──
+    signal_log = load_signal_log()
+    today_date = datetime.utcnow().date()
+    def _had_recent_sell(ticker):
+        entry = signal_log.get(ticker)
+        if not entry:
+            return False
+        date_str = entry.get("last_sell_signal_date", "")
+        try:
+            d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            return (today_date - d).days <= SELL_SIGNAL_BLACKOUT_DAYS
+        except Exception:
+            return False
+
+    pre_filter_count = len(momentum_map)
+    momentum_map = {t: v for t, v in momentum_map.items()
+                    if not _had_recent_sell(t)}
+    excluded = pre_filter_count - len(momentum_map)
+    if excluded:
+        print(f"[monthly] excluded {excluded} ticker(s) with recent SELL signal")
+
     # Rank by score descending, take only those ≥ 65 (BUY threshold), top 2.
     ranked = sorted(
         ((t, s, d) for t, (s, d) in momentum_map.items() if s is not None),
@@ -1879,6 +2029,18 @@ def run_monthly_screen(chat_id):
         )
     except Exception as exc:
         print(f"[recs] monthly logging failed: {exc}")
+
+    # Record the monthly picks so /buy can grant the 5-day SELL-protection
+    # window when the user actually executes the trade.
+    try:
+        picks_log = load_monthly_picks()
+        rec_date = datetime.utcnow().strftime("%Y-%m-%d")
+        for entry in parsed_for_log:
+            picks_log[entry["ticker"]] = rec_date
+        save_monthly_picks(picks_log)
+        print(f"[monthly] recorded picks: {[e['ticker'] for e in parsed_for_log]}")
+    except Exception as exc:
+        print(f"[monthly] picks logging failed: {exc}")
 
 
 # ===========================================================================
@@ -2550,6 +2712,19 @@ def handle_buy(args, chat_id):
     atr_pct, _ = calculate_atr(ticker)
     atr_stop_pct = get_atr_stop_pct(atr_pct)
 
+    # ── Monthly-screen buy protection ────────────────────────────────
+    # If this ticker was recommended by the most recent monthly screen,
+    # stamp the position with monthly_buy_date so the daily SELL logic
+    # grants it a ≈5-trading-day suppression window.
+    today_iso_buy = datetime.utcnow().strftime("%Y-%m-%d")
+    monthly_picks = load_monthly_picks()
+    monthly_buy_date = None
+    if ticker in monthly_picks:
+        rec_date = monthly_picks[ticker]
+        days_since = _cal_days_since(rec_date)
+        if days_since <= 30:   # only within last 30 days counts as "recent"
+            monthly_buy_date = today_iso_buy
+
     portfolio[ticker] = {
         "shares": shares,
         "entry_price": price,
@@ -2558,13 +2733,15 @@ def handle_buy(args, chat_id):
         # alert state for the new target-based system
         "approach_alerted": False,
         "above_alerted": False,
-        # New: trailing stop / sector / ATR fields per spec.
+        # Trailing stop / sector / ATR fields.
         "peak_price": price,
         "sector": sector,
         "atr_pct": atr_pct,
         "atr_stop_pct": atr_stop_pct,
-        "atr_last_calc": datetime.utcnow().strftime("%Y-%m-%d"),
+        "atr_last_calc": today_iso_buy,
         "tightened_stop": False,
+        # Monthly-screen protection window (None if not a monthly pick).
+        "monthly_buy_date": monthly_buy_date,
     }
     save_portfolio(portfolio)
 
@@ -2601,6 +2778,13 @@ def handle_buy(args, chat_id):
     lines.append(
         f"Cost: ${cost:,.2f} | Cash remaining: ${new_cash:,.2f}"
     )
+    if monthly_buy_date:
+        lines.append(
+            f"🛡 Monthly-screen protection active — SELL signals suppressed "
+            f"for the first {MONTHLY_BUY_PROTECTION_CAL_DAYS} calendar days "
+            f"(unless trailing stop is breached or score stays below 35 for "
+            f"2 consecutive days)."
+        )
     if new_cash < 0:
         lines.append(
             "_⚠️ Cash balance is negative — you've over-allocated. "
@@ -3027,10 +3211,51 @@ def handle_portfolio(chat_id, scheduled=False):
                 and current > target
             )
 
-            # Persist the freshly-computed score so tomorrow's scheduled
-            # run can compare against today's value.
+            # ── Signal confirmation — prevent daily momentum flipping ───
+            # SELL via score only fires if confirmed (prevents day-to-day
+            # flipping on a single noisy reading):
+            #   (a) dramatic collapse: score dropped > SELL_CONFIRM_DROP pts
+            #   (b) two consecutive days below 35 threshold
+            # Trailing-stop breach is always immediate — no confirmation.
+            # Monthly-screen-buy protection (≈5 trading days) adds a second
+            # gate: during the window, only (b) OR stop_breached can fire
+            # a SELL — dramatic-only drops are suppressed to WATCH.
+            in_protection = _in_monthly_buy_protection(pos)
+
+            prev_for_check = pos.get("momentum_score")
+            consecutive_low = (
+                score is not None and score < 35
+                and prev_for_check is not None and prev_for_check < 35
+            )
+            dramatic_drop = (
+                score is not None and score < 35
+                and prev_for_check is not None
+                and (prev_for_check - score) > SELL_CONFIRM_DROP
+            )
+            confirmed_sell = stop_breached or consecutive_low or dramatic_drop
+
+            if signal == "SELL" and not stop_breached:
+                if not confirmed_sell:
+                    # First day below 35 — unconfirmed, downgrade to WATCH.
+                    signal = "WATCH"
+                    color = "🟡"
+                elif in_protection and not consecutive_low:
+                    # In protection window and only dramatic-drop triggered —
+                    # spec requires consecutive_low or stop to break protection.
+                    signal = "WATCH"
+                    color = "🟡"
+
+            # ── Persist score + score_history + last_signal ─────────────
+            # prev_score was captured before the new score was computed.
+            prev_signal = pos.get("last_signal")
             if score is not None and pos.get("momentum_score") != score:
                 pos["momentum_score"] = score
+                portfolio_dirty = True
+            if score is not None:
+                _update_score_history(pos, score, today_iso)
+                portfolio_dirty = True
+            if pos.get("last_signal") != signal:
+                pos["last_signal"] = signal
                 portfolio_dirty = True
 
             common = {
@@ -3043,6 +3268,9 @@ def handle_portfolio(chat_id, scheduled=False):
                 "sector": pos.get("sector"),
                 "signal": signal, "color": color,
                 "score": score, "prev_score": prev_score,
+                "prev_signal": prev_signal,
+                "in_protection": in_protection,
+                "confirmed_sell": confirmed_sell,
                 "details": details, "reason": None,
                 "stop_breached": stop_breached,
                 "above_target": above_target,
@@ -3091,10 +3319,14 @@ def handle_portfolio(chat_id, scheduled=False):
     # ── Scheduled-only urgent alerts (sent BEFORE the main report) ─────
     if scheduled:
         for r in records:
-            # SELL alert fires whenever the rule overlay says SELL —
-            # whether the trigger was momentum < 35 OR the trailing
-            # stop being breached.
+            # SELL alert fires when the confirmed signal is SELL.
+            # Unconfirmed first-day sub-35 scores have already been
+            # downgraded to WATCH above — those don't reach here as SELL.
             if r["signal"] == "SELL":
+                # Record every real SELL signal so the monthly screen can
+                # filter out recently-sold stocks.
+                record_sell_signal(r["ticker"], today_iso)
+
                 if r.get("stop_breached"):
                     pl_pct_txt = (
                         f"{r['pl_pct']:+.1f}%" if r.get("pl_pct") is not None
@@ -3111,8 +3343,8 @@ def handle_portfolio(chat_id, scheduled=False):
                     )
                 else:
                     trigger = (
-                        f"Momentum score collapsed to {r['score']}/100 "
-                        f"(< 35 SELL threshold)."
+                        f"Momentum score {r['score']}/100 below 35 "
+                        f"for 2 consecutive days — SELL confirmed."
                     )
                 send_telegram(
                     f"🚨 SELL ALERT — {r['ticker']}\n"
@@ -3121,6 +3353,19 @@ def handle_portfolio(chat_id, scheduled=False):
                     chat_id,
                     parse_mode=None,
                 )
+            elif (r["score"] is not None and r.get("in_protection")
+                    and r["score"] < 35):
+                # In monthly-buy protection — SELL suppressed, but warn.
+                send_telegram(
+                    f"⚠️ WATCH (protected) — {r['ticker']}\n"
+                    f"Score {r['score']}/100 — below SELL threshold but "
+                    f"within {MONTHLY_BUY_PROTECTION_CAL_DAYS}-day monthly-"
+                    f"screen protection window. No SELL unless stop hit or "
+                    f"score stays below 35 tomorrow.",
+                    chat_id,
+                    parse_mode=None,
+                )
+
             if (r["score"] is not None and r["prev_score"] is not None
                     and (r["prev_score"] - r["score"]) > 20):
                 send_telegram(
@@ -3216,11 +3461,42 @@ def handle_portfolio(chat_id, scheduled=False):
                 f"≤ stop ${r['stop']:.2f}{mode_txt}\n"
             )
 
+        # ── Signal stability indicator ───────────────────────────────────
+        # "Stable" if signal unchanged from yesterday; "Changing" if it
+        # flipped — show yesterday and today score side by side.
+        prev_sig = r.get("prev_signal")
+        cur_sig = r.get("signal")
+        if prev_sig is None:
+            stability_line = "Signal stability: — (first reading)\n"
+        elif prev_sig == cur_sig:
+            stability_line = f"Signal stability: Stable ({cur_sig})\n"
+        else:
+            prev_sc = r.get("prev_score")
+            cur_sc = r.get("score")
+            prev_sc_txt = f"{prev_sc}/100" if prev_sc is not None else "n/a"
+            cur_sc_txt = f"{cur_sc}/100" if cur_sc is not None else "n/a"
+            stability_line = (
+                f"Signal stability: Changing ⚠️  "
+                f"{prev_sig} ({prev_sc_txt}) → {cur_sig} ({cur_sc_txt})\n"
+            )
+
+        # Monthly-buy protection note (shown when SELL would have fired
+        # but is being suppressed inside the 5-day protection window).
+        protection_line = ""
+        if r.get("in_protection") and r.get("score") is not None and r["score"] < 35:
+            protection_line = (
+                f"🛡 Monthly-screen protection active — SELL suppressed "
+                f"(score {r['score']}/100 < 35 but within "
+                f"{MONTHLY_BUY_PROTECTION_CAL_DAYS}-day window)\n"
+            )
+
         # Spec format: full momentum breakdown then position math then reason.
         _send_chunked(
             f"{r['color']} {r['ticker']} — {r['signal']}\n"
             f"{sector_line}"
             f"Momentum Score: {score_str}\n"
+            f"{stability_line}"
+            f"{protection_line}"
             f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
             f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
             f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"

@@ -6,7 +6,13 @@
     "analyst_target": 268.8725,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 25
+    "momentum_score": 25,
+    "peak_price": 263.42,
+    "sector": "Technology",
+    "tightened_stop": false,
+    "atr_pct": 4.33,
+    "atr_stop_pct": -10.0,
+    "atr_last_calc": "2026-04-29"
   },
   "ADSK": {
     "shares": 2.0,
@@ -15,7 +21,13 @@
     "analyst_target": 325.54843,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 32
+    "momentum_score": 25,
+    "peak_price": 305.93,
+    "sector": "Technology",
+    "tightened_stop": false,
+    "atr_pct": 4.25,
+    "atr_stop_pct": -10.0,
+    "atr_last_calc": "2026-04-29"
   },
   "NIO": {
     "shares": 38.0,
@@ -24,7 +36,14 @@
     "analyst_target": 6.661333,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 45
+    "momentum_score": 38,
+    "peak_price": 7.9,
+    "sector": "Consumer Cyclical",
+    "tightened_stop": true,
+    "atr_pct": 4.6,
+    "atr_stop_pct": -10.0,
+    "atr_last_calc": "2026-04-29",
+    "tightened_stop_price": 7.11
   },
   "NVDA": {
     "shares": 3.0,
@@ -34,7 +53,13 @@
     "analyst_target": 268.6148,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 82
+    "momentum_score": 82,
+    "peak_price": 213.17,
+    "sector": "Technology",
+    "tightened_stop": false,
+    "atr_pct": 2.68,
+    "atr_stop_pct": -7.0,
+    "atr_last_calc": "2026-04-29"
   },
   "SCHW": {
     "shares": 4.0,
@@ -43,7 +68,13 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 25
+    "momentum_score": 25,
+    "peak_price": 90.84,
+    "sector": "Financial Services",
+    "tightened_stop": false,
+    "atr_pct": 3.19,
+    "atr_stop_pct": -7.0,
+    "atr_last_calc": "2026-04-29"
   },
   "AVGO": {
     "shares": 2.0,
@@ -52,6 +83,12 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 72
+    "momentum_score": 65,
+    "peak_price": 399.83,
+    "sector": "Technology",
+    "tightened_stop": false,
+    "atr_pct": 3.2,
+    "atr_stop_pct": -7.0,
+    "atr_last_calc": "2026-04-29"
   }
 }
