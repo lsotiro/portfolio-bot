@@ -1,0 +1,29 @@
+kind = "api"
+previewPath = "/"
+title = "Portfolio Bot"
+version = "1.0.0"
+id = "pBotXk9mNqR3vYwZ2Lc5"
+
+[[services]]
+localPort = 5000
+name = "Portfolio Bot"
+paths = ["/"]
+
+[services.development]
+# Dev is handled by the "Portfolio Bot" workflow which runs from
+# the workspace root. This command uses cd to ensure portability
+# regardless of which directory the artifact runner starts in.
+run = "cd /home/runner/workspace && python3 portfolio-bot/main.py"
+
+[services.production]
+
+[services.production.run]
+# Production containers run from the workspace root — same as
+# how api-server uses "artifacts/api-server/dist/index.mjs".
+args = ["python3", "portfolio-bot/main.py"]
+
+[services.production.run.env]
+PORT = "5000"
+
+[services.production.health.startup]
+path = "/ping"
