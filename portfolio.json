@@ -34,7 +34,7 @@
     "analyst_target": 268.6148,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 75,
+    "momentum_score": 55,
     "peak_price": 213.17,
     "sector": "Technology",
     "tightened_stop": false,
@@ -48,10 +48,10 @@
       },
       {
         "date": "2026-04-30",
-        "score": 75
+        "score": 55
       }
     ],
-    "last_signal": "BUY"
+    "last_signal": "HOLD"
   },
   "SCHW": {
     "shares": 4.0,
@@ -88,7 +88,7 @@
     "approach_alerted": false,
     "above_alerted": false,
     "momentum_score": 65,
-    "peak_price": 405.45,
+    "peak_price": 417.43,
     "sector": "Technology",
     "tightened_stop": false,
     "atr_pct": 3.2,
