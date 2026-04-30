@@ -60,6 +60,10 @@ import schedule
 import yfinance as yf
 from flask import Flask
 
+BOT_VERSION = "2.0"
+BOT_VERSION_LABEL = "Portfolio Bot v2.0 - Momentum System"
+print(f"[boot] {BOT_VERSION_LABEL} loading...")
+
 # Hard trade rules (always override fundamentals)
 STOP_LOSS_PCT = -7.0              # default trailing stop (normal volatility)
 STOP_LOSS_PCT_HIGH_VOL = -10.0    # ATR > 4% — wider stop avoids whipsaw
@@ -5085,13 +5089,15 @@ if __name__ == "__main__":
     print(
         "\n"
         "┌─────────────────────────────────────────────────┐\n"
-        "│           Portfolio Bot — STARTED               │\n"
+        f"│     Portfolio Bot v{BOT_VERSION} — Momentum System       │\n"
+        "│                    STARTED                      │\n"
         "├─────────────────────────────────────────────────┤\n"
         f"│  Web server  : http://0.0.0.0:{_web_port}               │\n"
         f"│  /ping       : http://0.0.0.0:{_web_port}/ping          │\n"
         f"│  Telegram    : polling …                        │\n"
         f"│  Dashboard   : {dash_status:<33} │\n"
         "│  Scheduler   : 08:00/08:30/09:00 UTC jobs       │\n"
+        "│  Score 0-100 : price+RS+RVOL+news+earnings      │\n"
         "└─────────────────────────────────────────────────┘\n"
     )
 
