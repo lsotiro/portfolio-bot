@@ -22,6 +22,10 @@
       {
         "date": "2026-04-30",
         "score": 48
+      },
+      {
+        "date": "2026-05-01",
+        "score": 48
       }
     ],
     "last_signal": "SELL"
@@ -49,6 +53,10 @@
       {
         "date": "2026-04-30",
         "score": 55
+      },
+      {
+        "date": "2026-05-01",
+        "score": 55
       }
     ],
     "last_signal": "HOLD"
@@ -60,7 +68,7 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 35,
+    "momentum_score": 42,
     "peak_price": 90.84,
     "sector": "Financial Services",
     "tightened_stop": true,
@@ -75,6 +83,10 @@
       {
         "date": "2026-04-30",
         "score": 35
+      },
+      {
+        "date": "2026-05-01",
+        "score": 42
       }
     ],
     "last_signal": "WATCH",
@@ -101,6 +113,10 @@
       },
       {
         "date": "2026-04-30",
+        "score": 65
+      },
+      {
+        "date": "2026-05-01",
         "score": 65
       }
     ],

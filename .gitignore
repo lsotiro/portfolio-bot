@@ -47,3 +47,32 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+.replit
+replit.nix
+.replit-artifact/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+secrets.json
+credentials.json
+
+# Bot runtime data (keep locally, don't commit to GitHub)
+portfolio.json
+cash.json
+monthly_picks.json
+signal_log.json
+recommendations_log.json
