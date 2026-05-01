@@ -9,6 +9,7 @@ Commands you can send the bot:
   /monthly                   run the monthly S&P 500 + Nasdaq 100 buy screen
   /earnings                  list upcoming earnings (next 30 days)
   /health                    portfolio health score (0–10) with breakdown
+  /market                    current market status (open/closed, ET time, holiday check)
 
 Signal engine — 100-point momentum score per stock:
   Price momentum (30) + RS vs SPY (20) + volume confirm (15)
@@ -44,6 +45,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from threading import Thread
+from zoneinfo import ZoneInfo
 
 # This file is launched as `python3 portfolio-bot/main.py`, so its
 # module name in sys.modules is "__main__". Without this alias, any
@@ -96,6 +98,85 @@ MONTHLY_BUY_PROTECTION_CAL_DAYS = 7  # ≈5 trading days: suppress non-stop SELL
                                       # a stock is recommended by the monthly screen
 SELL_SIGNAL_BLACKOUT_DAYS = 7     # days to exclude a ticker from the monthly
                                    # BUY screen after it generated a SELL signal
+
+
+# ---------------------------------------------------------------------------
+# Market calendar — NYSE trading day + hours awareness
+# ---------------------------------------------------------------------------
+_ET = ZoneInfo("America/New_York")
+
+# NYSE observed holidays 2025-2027.  Add new years at the end each January.
+_NYSE_HOLIDAYS = {
+    # 2025
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18",
+    "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01",
+    "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+    "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+    "2027-11-25", "2027-12-24",
+}
+
+
+def is_market_holiday(d=None):
+    """True if *d* (date, default today ET) is an NYSE holiday."""
+    if d is None:
+        d = datetime.now(_ET).date()
+    return d.strftime("%Y-%m-%d") in _NYSE_HOLIDAYS
+
+
+def is_trading_day(d=None):
+    """True if *d* is Mon–Fri and not an NYSE holiday."""
+    if d is None:
+        d = datetime.now(_ET).date()
+    return d.weekday() < 5 and not is_market_holiday(d)
+
+
+def is_market_open(dt=None):
+    """True if NYSE is currently open (9:30–16:00 ET on a trading day)."""
+    if dt is None:
+        dt = datetime.now(_ET)
+    if not is_trading_day(dt.date()):
+        return False
+    open_t  = dt.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = dt.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= dt < close_t
+
+
+def market_status_line():
+    """Short human-readable market status string for Telegram messages."""
+    now_et = datetime.now(_ET)
+    d = now_et.date()
+    day_name = now_et.strftime("%A")
+    date_str = now_et.strftime("%b %d")
+    if d.weekday() >= 5:
+        return f"⏸ Market closed — {day_name} (weekend)"
+    if is_market_holiday(d):
+        return f"⏸ Market closed — {day_name} {date_str} (US market holiday)"
+    open_t  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if now_et < open_t:
+        mins = int((open_t - now_et).total_seconds() // 60)
+        h, m = divmod(mins, 60)
+        eta = f"{h}h {m}m" if h else f"{m}m"
+        return f"⏰ Pre-market — opens in {eta} (9:30 AM ET)"
+    if now_et >= close_t:
+        return f"🔔 After-hours — closed at 4:00 PM ET"
+    return f"🟢 Market open — {now_et.strftime('%I:%M %p')} ET"
+
+
+def _skip_if_not_trading_day(label):
+    """Print a skip notice and return True when today is not a trading day.
+    Used as a guard at the top of every scheduled job."""
+    if not is_trading_day():
+        print(f"[{label}] skipping — not a trading day "
+              f"({market_status_line()})")
+        return True
+    return False
 
 
 def _status_emoji(pl_pct):
@@ -2053,6 +2134,17 @@ def run_monthly_screen(chat_id):
       6. Log each pick to the rec log with ``momentum_score_at_recommendation``.
     The Claude 5-pillar framework call is no longer used here.
     """
+    if not is_trading_day():
+        send_telegram(
+            f"{market_status_line()}\n\n"
+            "The monthly screen uses live price momentum data — running it on a "
+            "weekend or holiday would score stocks on stale Friday prices.\n"
+            "Please run /monthly on a weekday when the market is open (or "
+            "pre-market is fine too).",
+            chat_id,
+        )
+        return
+
     send_telegram(
         "*Running monthly S&P 500 + Nasdaq 100 buy screen...*\n"
         "Building universe, applying fundamental filter + momentum ranking. "
@@ -3263,6 +3355,16 @@ def handle_portfolio(chat_id, scheduled=False):
     Yesterday's score is read from ``portfolio[ticker]['momentum_score']``
     and the new score is written back at the end of every run.
     """
+    # Show market status at the top of every portfolio view.
+    msl = market_status_line()
+    if not is_trading_day():
+        send_telegram(
+            f"{msl}\n_Scores are based on the last available trading session._",
+            chat_id,
+        )
+    else:
+        send_telegram(msl, chat_id)
+
     portfolio = load_portfolio()
     if not portfolio:
         send_telegram(
@@ -3794,9 +3896,11 @@ def handle_deep(args, chat_id):
         )
         return
     ticker = args[0].upper()
+    msl = market_status_line()
+    market_note = "" if is_trading_day() else f"\n_{msl} — using last session data._"
     send_telegram(
         f"*Running momentum analysis on {ticker}...*\n"
-        "Pulling 12-week price history, news & earnings. ~10s.",
+        f"Pulling 12-week price history, news & earnings. ~10s.{market_note}",
         chat_id,
     )
 
@@ -3924,7 +4028,8 @@ def handle_start(chat_id):
         "`/deep TICKER` — full momentum analysis on any stock\n"
         "`/monthly` — monthly S&P 500 + Nasdaq 100 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
-        "`/performance` — track record vs S&P 500\n\n"
+        "`/performance` — track record vs S&P 500\n"
+        "`/market` — market status (open/closed, ET time, holiday check)\n\n"
         "_Hard SELL rules:_\n"
         "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
         "_• Tightened to -3% from current when momentum score 35–49_\n"
@@ -4020,6 +4125,20 @@ def poll_telegram():
                             args=(chat_id,),
                             daemon=True,
                         ).start()
+                    elif cmd == "/market":
+                        now_et = datetime.now(_ET)
+                        day_str = now_et.strftime("%A, %b %d %Y • %I:%M %p ET")
+                        trading = "Yes ✅" if is_trading_day() else "No ❌"
+                        open_now = "Yes 🟢" if is_market_open() else "No ⏸"
+                        send_telegram(
+                            f"*Market Status*\n"
+                            f"{market_status_line()}\n\n"
+                            f"Date/Time (ET): {day_str}\n"
+                            f"Trading day: {trading}\n"
+                            f"Market open now: {open_now}\n"
+                            f"NYSE hours: 9:30 AM – 4:00 PM ET",
+                            chat_id,
+                        )
                     elif cmd == "/performance":
                         send_telegram(
                             "Analyzing… please wait", chat_id,
@@ -4417,6 +4536,8 @@ def handle_cash(chat_id):
 
 def scheduled_health_check():
     """Daily 08:30 UTC morning health check (between earnings and analysis)."""
+    if _skip_if_not_trading_day("health-check"):
+        return
     chat_id = recall_chat()
     if chat_id is None:
         print("Skipping health check — no chat has interacted yet.")
@@ -4756,6 +4877,8 @@ def handle_earnings(chat_id):
 
 def scheduled_earnings_check():
     """Daily 08:00 UTC pre-market earnings sweep."""
+    if _skip_if_not_trading_day("earnings-check"):
+        return
     chat_id = recall_chat()
     if chat_id is None:
         print("Skipping earnings check — no chat has interacted yet.")
@@ -4769,6 +4892,8 @@ def scheduled_earnings_check():
 
 def scheduled_recommendation_review():
     """Daily 07:30 UTC — grade any recs hitting their 4w / 8w window."""
+    if _skip_if_not_trading_day("rec-review"):
+        return
     chat_id = recall_chat()
     print("[scheduled] running recommendation review check")
     try:
@@ -4795,6 +4920,8 @@ def scheduled_weekly_summary():
 # Scheduled daily run at 09:00 UTC
 # ---------------------------------------------------------------------------
 def scheduled_run():
+    if _skip_if_not_trading_day("portfolio-run"):
+        return
     chat_id = recall_chat()
     if chat_id is None:
         print("Skipping scheduled run — no chat has interacted with the bot yet.")
@@ -4834,6 +4961,8 @@ def check_gap_down(chat_id=None):
     its trailing stop in the pre-market session. Sends one alert per
     breached position and a single "all clear" line if nothing tripped.
     """
+    if _skip_if_not_trading_day("gap-down"):
+        return
     if chat_id is None:
         chat_id = recall_chat()
     if chat_id is None:
