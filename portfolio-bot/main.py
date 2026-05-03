@@ -10,6 +10,9 @@ Commands you can send the bot:
   /earnings                  list upcoming earnings (next 30 days)
   /health                    portfolio health score (0–10) with breakdown
   /market                    current market status (open/closed, ET time, holiday check)
+  /settings                  view or change bot settings (delivery time, on/off)
+    /settings delivery on|off   toggle automatic daily delivery
+    /settings time HH:MM        set delivery time in UTC (e.g. /settings time 08:30)
 
 Signal engine — 100-point momentum score per stock:
   Price momentum (30) + RS vs SPY (20) + volume confirm (15)
@@ -240,6 +243,7 @@ LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
 RECS_LOG_FILE = "recommendations_log.json"   # feedback-loop history
 MONTHLY_PICKS_FILE = "monthly_picks.json"    # {ticker: ISO-date} of last monthly rec
 SIGNAL_LOG_FILE = "signal_log.json"          # {ticker: last_sell_signal_date} log
+SETTINGS_FILE = "bot_settings.json"          # user-configurable bot settings
 
 # Review windows for recommendation tracking (calendar days).
 REVIEW_4W_DAYS = 28
@@ -397,6 +401,25 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# User settings (bot_settings.json)
+# ---------------------------------------------------------------------------
+_SETTINGS_DEFAULTS = {
+    "daily_delivery": True,        # send /portfolio automatically each day
+    "delivery_time_utc": "09:00",  # HH:MM UTC — when to send it
+    "timezone_display": "ET",      # label shown in market status lines
+}
+
+
+def load_settings():
+    data = load_json(SETTINGS_FILE, {})
+    return {**_SETTINGS_DEFAULTS, **data}
+
+
+def save_settings(data):
+    save_json(SETTINGS_FILE, data)
 
 
 def load_portfolio():
@@ -4029,7 +4052,8 @@ def handle_start(chat_id):
         "`/monthly` — monthly S&P 500 + Nasdaq 100 buy screen (top 2 picks)\n"
         "`/review` — open recommendations + 4w/8w countdowns\n"
         "`/performance` — track record vs S&P 500\n"
-        "`/market` — market status (open/closed, ET time, holiday check)\n\n"
+        "`/market` — market status (open/closed, ET time, holiday check)\n"
+        "`/settings` — view/change delivery time and on/off toggle\n\n"
         "_Hard SELL rules:_\n"
         "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
         "_• Tightened to -3% from current when momentum score 35–49_\n"
@@ -4139,6 +4163,8 @@ def poll_telegram():
                             f"NYSE hours: 9:30 AM – 4:00 PM ET",
                             chat_id,
                         )
+                    elif cmd == "/settings":
+                        handle_settings(args, chat_id)
                     elif cmd == "/performance":
                         send_telegram(
                             "Analyzing… please wait", chat_id,
@@ -4453,6 +4479,111 @@ def handle_health(chat_id):
         return
     report = calculate_health_score(portfolio)
     _send_chunked(format_health_breakdown(report), chat_id)
+
+
+def handle_settings(args, chat_id):
+    """`/settings` — view or change bot delivery settings.
+
+    Sub-commands:
+      /settings                  — show current settings
+      /settings delivery on|off  — toggle automatic daily delivery
+      /settings time HH:MM       — set delivery time (UTC, 24-hour)
+    """
+    settings = load_settings()
+
+    # ── /settings delivery on|off ────────────────────────────────────────────
+    if args and args[0].lower() == "delivery":
+        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+            send_telegram(
+                "Usage: /settings delivery on   or   /settings delivery off",
+                chat_id,
+            )
+            return
+        enabled = args[1].lower() == "on"
+        settings["daily_delivery"] = enabled
+        save_settings(settings)
+        state = "✅ enabled" if enabled else "❌ disabled"
+        delivery_time = settings.get("delivery_time_utc", "09:00")
+        msg = (
+            f"*Daily delivery {state}*\n"
+            + (
+                f"Automatic /portfolio will be sent at *{delivery_time} UTC* "
+                "every weekday."
+                if enabled
+                else "No automatic reports will be sent until you turn it back on."
+            )
+        )
+        send_telegram(msg, chat_id)
+        return
+
+    # ── /settings time HH:MM ─────────────────────────────────────────────────
+    if args and args[0].lower() == "time":
+        if len(args) < 2:
+            send_telegram(
+                "Usage: /settings time HH:MM\nExample: /settings time 08:30",
+                chat_id,
+            )
+            return
+        time_str = args[1].strip()
+        # Validate format
+        if not re.match(r"^\d{2}:\d{2}$", time_str):
+            send_telegram(
+                f"Invalid time '{time_str}' — use 24-hour HH:MM format, e.g. 08:30",
+                chat_id,
+            )
+            return
+        hh, mm = int(time_str[:2]), int(time_str[3:])
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            send_telegram(
+                f"Invalid time '{time_str}' — hours must be 00–23, minutes 00–59.",
+                chat_id,
+            )
+            return
+        settings["delivery_time_utc"] = time_str
+        save_settings(settings)
+        now_utc = datetime.utcnow()
+        current_hhmm = now_utc.strftime("%H:%M")
+        already_sent_today = (
+            _last_delivery_date == now_utc.date() if _last_delivery_date else False
+        )
+        note = (
+            " (already sent today — next delivery is tomorrow)"
+            if already_sent_today
+            else ""
+        )
+        send_telegram(
+            f"*Delivery time updated to {time_str} UTC*{note}\n"
+            "Change takes effect immediately — no restart needed.",
+            chat_id,
+        )
+        return
+
+    # ── /settings — show current config ──────────────────────────────────────
+    enabled = settings.get("daily_delivery", True)
+    delivery_time = settings.get("delivery_time_utc", "09:00")
+    tz_label = settings.get("timezone_display", "ET")
+    state_icon = "✅ On" if enabled else "❌ Off"
+
+    # Approximate ET equivalent (UTC-4 in summer, UTC-5 in winter).
+    try:
+        hh, mm = int(delivery_time[:2]), int(delivery_time[3:])
+        now_et = datetime.now(_ET)
+        utc_offset = int(now_et.utcoffset().total_seconds() // 3600)
+        et_hh = (hh + utc_offset) % 24
+        et_str = f"{et_hh:02d}:{mm:02d} {tz_label}"
+    except Exception:
+        et_str = "n/a"
+
+    send_telegram(
+        f"*Bot Settings*\n\n"
+        f"Daily delivery: {state_icon}\n"
+        f"Delivery time: *{delivery_time} UTC* ({et_str})\n"
+        f"Delivered: every weekday (Mon–Fri), skips holidays\n\n"
+        f"_To change:_\n"
+        f"`/settings delivery on` or `/settings delivery off`\n"
+        f"`/settings time HH:MM`  (24-hr UTC, e.g. 08:30)\n",
+        chat_id,
+    )
 
 
 def handle_cash(chat_id):
@@ -4917,9 +5048,13 @@ def scheduled_weekly_summary():
 
 
 # ---------------------------------------------------------------------------
-# Scheduled daily run at 09:00 UTC
+# Scheduled daily run — time configurable via /settings
 # ---------------------------------------------------------------------------
+_last_delivery_date = None   # tracks last date portfolio was auto-sent
+
+
 def scheduled_run():
+    """Core daily portfolio delivery — called by the flexible dispatcher below."""
     if _skip_if_not_trading_day("portfolio-run"):
         return
     chat_id = recall_chat()
@@ -4931,6 +5066,27 @@ def scheduled_run():
     # ``scheduled=True`` enables the per-position SELL-on-<35 alerts and
     # WARNING alerts when the score dropped >20 pts vs yesterday.
     handle_portfolio(chat_id, scheduled=True)
+
+
+def _flexible_daily_delivery():
+    """Runs every minute — fires ``scheduled_run`` exactly once per trading
+    day when the clock matches the user-configured delivery_time_utc.
+
+    Using a per-minute poller lets the user change the delivery time via
+    /settings without restarting the bot.
+    """
+    global _last_delivery_date
+    settings = load_settings()
+    if not settings.get("daily_delivery", True):
+        return
+    delivery_time = settings.get("delivery_time_utc", "09:00")
+    now_utc = datetime.utcnow()
+    current_hhmm = now_utc.strftime("%H:%M")
+    today = now_utc.date()
+    if current_hhmm == delivery_time and _last_delivery_date != today:
+        _last_delivery_date = today
+        print(f"[daily-delivery] firing at {delivery_time} UTC")
+        scheduled_run()
 
 
 # ---------------------------------------------------------------------------
@@ -5184,10 +5340,10 @@ schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays 
 # Pre-market gap-down sweep — runs alongside the earnings/weekly sweep.
 schedule.every().day.at("08:00", "UTC").do(check_gap_down)
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
-# Unified daily portfolio view at 09:00 UTC — pre-US-open. Uses analyst
-# targets + last-known prices to deliver the morning briefing before the
-# market moves.
-schedule.every().day.at("09:00", "UTC").do(scheduled_run)
+# Daily portfolio delivery — time is user-configurable via /settings.
+# A per-minute poller fires scheduled_run() when the clock matches the
+# configured delivery_time_utc, so time changes take effect immediately.
+schedule.every().minute.do(_flexible_daily_delivery)
 
 
 # ---------------------------------------------------------------------------
