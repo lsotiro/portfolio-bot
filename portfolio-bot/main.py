@@ -227,6 +227,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
 ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 # How many days before earnings we send a heads-up alert.
 EARNINGS_ALERT_DAYS = 3
@@ -1747,6 +1748,75 @@ def _news_keyword_score(articles):
     return score, f"{pos} positive, {neg} negative"
 
 
+def _finnhub_earnings_beat(ticker):
+    """Query Finnhub for the most recent earnings beat.
+
+    Returns (beat: bool | None, actual: float | None, estimate: float | None,
+             period: str | None).  Returns (None, None, None, None) when the
+    key is absent, the request fails, or no quarterly data is available.
+
+    Finnhub /stock/earnings returns quarters newest-first.
+    """
+    if not FINNHUB_API_KEY:
+        return None, None, None, None
+    try:
+        url = (
+            f"https://finnhub.io/api/v1/stock/earnings"
+            f"?symbol={ticker}&token={FINNHUB_API_KEY}"
+        )
+        resp = requests.get(url, timeout=8)
+        if resp.status_code != 200:
+            print(
+                f"[finnhub {ticker}] earnings HTTP {resp.status_code}: "
+                f"{resp.text[:120]}"
+            )
+            return None, None, None, None
+        data = resp.json()
+        if not data:
+            return None, None, None, None
+        latest = data[0]
+        actual = latest.get("actual")
+        estimate = latest.get("estimate")
+        period = latest.get("period", "")
+        print(
+            f"[finnhub {ticker}] earnings  period={period}  "
+            f"actual={actual}  estimate={estimate}  "
+            f"surprise={latest.get('surprisePercent')}%"
+        )
+        if actual is None or estimate is None:
+            return None, actual, estimate, period
+        beat = float(actual) > float(estimate)
+        return beat, actual, estimate, period
+    except Exception as exc:
+        print(f"[finnhub {ticker}] earnings fetch failed: {exc}")
+        return None, None, None, None
+
+
+def _finnhub_price_target(ticker):
+    """Return (target_mean: float | None) from Finnhub /stock/price-target."""
+    if not FINNHUB_API_KEY:
+        return None
+    try:
+        url = (
+            f"https://finnhub.io/api/v1/stock/price-target"
+            f"?symbol={ticker}&token={FINNHUB_API_KEY}"
+        )
+        resp = requests.get(url, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        target = data.get("targetMean") or data.get("targetMedian")
+        print(
+            f"[finnhub {ticker}] price-target  mean={data.get('targetMean')}  "
+            f"median={data.get('targetMedian')}  high={data.get('targetHigh')}  "
+            f"analysts={data.get('numberOfAnalysts')}"
+        )
+        return float(target) if target else None
+    except Exception as exc:
+        print(f"[finnhub {ticker}] price-target fetch failed: {exc}")
+        return None
+
+
 def score_momentum(ticker, hist=None, spy_hist=None, info=None,
                    news_articles=None):
     """Compute the 100-point momentum score for one ticker.
@@ -1871,51 +1941,113 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
         details["news_score"] = news_score
 
         # ── Earnings momentum (15 pts) ──────────────────────────────────
-        # 8 pts for last-quarter beat + 7 pts for analyst-target ≥10% upside.
-        # Both wrapped individually so a single yfinance hiccup never tanks
-        # the whole component.
+        # 8 pts: beat last quarter EPS estimate (Finnhub primary, yfinance fallback)
+        # 7 pts: analyst price target ≥10% above current price
+        # Each sub-component is wrapped so one failure never zeroes the other.
+        _ts = datetime.utcnow().strftime("%H:%M:%S UTC")
+        print(f"[momentum {ticker}] earnings check at {_ts}")
         earnings_score = 0
         details["earnings_beat"] = None
         details["estimates_rising"] = None
+
+        # ── 8 pts: EPS beat ─────────────────────────────────────────────
         try:
-            stock_obj = yf.Ticker(ticker)
-            # ``quarterly_earnings`` is fully deprecated in modern
-            # yfinance and always returns None. ``earnings_dates`` is the
-            # supported replacement — newest quarter first, includes
-            # estimate vs reported EPS for both PAST and UPCOMING dates.
-            # We need the most recent REPORTED quarter, so we filter out
-            # rows where Reported EPS is NaN (= future earnings dates).
-            try:
-                ed = stock_obj.earnings_dates
-                if (ed is not None and not ed.empty
-                        and "EPS Estimate" in ed.columns
-                        and "Reported EPS" in ed.columns):
-                    reported_only = ed.dropna(subset=["Reported EPS"])
+            # PRIMARY: Finnhub (more reliable, real-time consensus data)
+            fh_beat, fh_actual, fh_estimate, fh_period = _finnhub_earnings_beat(ticker)
+            if fh_beat is not None:
+                details["earnings_beat"] = fh_beat
+                details["_earnings_source"] = "finnhub"
+                details["_earnings_period"] = fh_period
+                details["_earnings_actual"] = fh_actual
+                details["_earnings_estimate"] = fh_estimate
+                if fh_beat:
+                    earnings_score += 8
+            else:
+                # FALLBACK: yfinance earnings_history
+                # Uses epsActual / epsEstimate columns (oldest-first, iloc[-1] = newest).
+                # More stable than earnings_dates whose column names have changed across
+                # yfinance versions.
+                print(f"[momentum {ticker}] Finnhub beat=None, falling back to yfinance")
+                stock_obj = yf.Ticker(ticker)
+                eh = stock_obj.earnings_history
+                if (eh is not None and not eh.empty
+                        and "epsActual" in eh.columns
+                        and "epsEstimate" in eh.columns):
+                    reported_only = eh.dropna(subset=["epsActual", "epsEstimate"])
                     if not reported_only.empty:
-                        # Already sorted newest-first by yfinance.
-                        latest = reported_only.iloc[0]
-                        actual = float(latest["Reported EPS"])
-                        estimate = float(latest["EPS Estimate"])
-                        if actual > estimate:
+                        latest = reported_only.iloc[-1]   # oldest-first → last = newest
+                        yf_actual = float(latest["epsActual"])
+                        yf_estimate = float(latest["epsEstimate"])
+                        yf_period = str(latest.name) if latest.name else ""
+                        yf_beat = yf_actual > yf_estimate
+                        details["earnings_beat"] = yf_beat
+                        details["_earnings_source"] = "yfinance"
+                        details["_earnings_period"] = yf_period
+                        details["_earnings_actual"] = yf_actual
+                        details["_earnings_estimate"] = yf_estimate
+                        print(
+                            f"[momentum {ticker}] yfinance fallback  "
+                            f"period={yf_period}  actual={yf_actual}  "
+                            f"estimate={yf_estimate}  beat={yf_beat}"
+                        )
+                        if yf_beat:
                             earnings_score += 8
-                            details["earnings_beat"] = True
-                        else:
-                            details["earnings_beat"] = False
-            except Exception as exc:
-                print(f"[momentum {ticker}] earnings_dates failed: {exc}")
-            target = (info or {}).get("targetMeanPrice") or 0
-            current_px = (info or {}).get("currentPrice") or current
+        except Exception as exc:
+            print(f"[momentum {ticker}] earnings_beat check failed: {exc}")
+
+        # ── 7 pts: analyst target ≥10% upside ───────────────────────────
+        try:
+            # Ensure we have a usable info dict (may be None if called standalone)
+            _info = info or {}
+            target = None
+
+            # PRIMARY: Finnhub price target (fresher consensus than yfinance)
+            fh_target = _finnhub_price_target(ticker)
+            if fh_target:
+                target = fh_target
+                details["_target_source"] = "finnhub"
+            else:
+                # FALLBACK: yfinance info dict — fetch it now if not pre-supplied
+                if not _info:
+                    try:
+                        _yf_obj = yf.Ticker(ticker)
+                        _info = _yf_obj.info or {}
+                        print(
+                            f"[momentum {ticker}] fetched yfinance info standalone  "
+                            f"targetMeanPrice={_info.get('targetMeanPrice')}  "
+                            f"currentPrice={_info.get('currentPrice')}"
+                        )
+                    except Exception as exc:
+                        print(f"[momentum {ticker}] yfinance info fetch failed: {exc}")
+                target = _info.get("targetMeanPrice") or 0
+                details["_target_source"] = "yfinance"
+
+            current_px = _info.get("currentPrice") or current
+            upside_pct = ((target / current_px) - 1) * 100 if target and current_px else 0
+            print(
+                f"[momentum {ticker}] price-target  target={target}  "
+                f"current={current_px:.2f}  upside={upside_pct:.1f}%  "
+                f"qualifies={bool(target and target > current_px * 1.10)}"
+            )
             if target and target > current_px * 1.10:
                 earnings_score += 7
                 details["estimates_rising"] = True
             else:
                 details["estimates_rising"] = False
-        except Exception:
-            # If yf.Ticker itself blew up, leave earnings_score at 0 —
-            # don't artificially inflate the score on a hard failure.
-            earnings_score = 0
+            details["_target_price"] = round(target, 2) if target else None
+            details["_target_upside_pct"] = round(upside_pct, 1)
+        except Exception as exc:
+            print(f"[momentum {ticker}] price-target check failed: {exc}")
+            details["estimates_rising"] = False
+
         score += earnings_score
         details["earnings_score"] = earnings_score
+        print(
+            f"[momentum {ticker}] earnings_score={earnings_score}  "
+            f"beat={details.get('earnings_beat')}  "
+            f"target_upside={details.get('_target_upside_pct')}%  "
+            f"estimates_rising={details.get('estimates_rising')}"
+        )
 
     except Exception as exc:
         print(f"[momentum {ticker}] hard failure: {exc}")
