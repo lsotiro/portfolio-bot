@@ -1795,7 +1795,15 @@ _NEGATIVE_NEWS = (
 
 
 def _news_keyword_score(articles):
-    """Return (news_score:int, label:str) per the spec's keyword heuristic."""
+    """Return (news_score:int, label:str) per the spec's keyword heuristic.
+
+    Label contract:
+      "No relevant news"          — no articles fetched at all
+      "X positive, Y negative"    — articles were fetched; X/Y are keyword counts
+                                    (both may be 0 if no signal words matched)
+    This distinction lets the display layer show accurate counts vs a true
+    data-absent state.
+    """
     if not articles:
         return 10, "No relevant news"
     pos = neg = 0
@@ -1810,7 +1818,9 @@ def _news_keyword_score(articles):
             neg += 1
     total = pos + neg
     if total == 0:
-        return 10, "No relevant news"
+        # Articles were fetched but none matched signal keywords — neutral,
+        # not "no news". Show the count so the display is honest.
+        return 10, f"0 positive, 0 negative ({len(articles)} articles, no signal words)"
     ratio = pos / total
     if ratio >= 0.7:
         score = 20
@@ -4177,7 +4187,12 @@ def handle_deep(args, chat_id):
                 info = yf.Ticker(ticker).info
             except Exception:
                 info = None
-            news = get_stock_news(ticker, days=1, page_size=10)
+            # Finnhub company-news is the primary source (ticker-specific,
+            # 20 articles, 3-day window). NewsAPI is the fallback.
+            news = get_finnhub_news(ticker, days=3)
+            if not news:
+                print(f"[/deep {ticker}] Finnhub news empty, falling back to NewsAPI")
+                news = get_stock_news(ticker, days=3, page_size=10)
 
             score, details = score_momentum(
                 ticker, info=info, news_articles=news,
