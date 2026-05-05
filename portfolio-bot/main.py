@@ -1254,12 +1254,25 @@ def aggregate_sentiment(articles):
     return sum(a.get("sentiment", 0) for a in articles) / len(articles)
 
 
-def fetch_news_bulk(tickers, days=1, max_workers=10):
-    """Fetch news for many tickers in parallel. Returns {ticker: [articles]}."""
+def _fetch_news_one(ticker, days):
+    """Fetch news for a single ticker: Finnhub primary, NewsAPI fallback."""
+    arts = get_finnhub_news(ticker, days=days)
+    if not arts:
+        arts = get_stock_news(ticker, days=days, page_size=10)
+    return arts
+
+
+def fetch_news_bulk(tickers, days=3, max_workers=10):
+    """Fetch news for many tickers in parallel. Returns {ticker: [articles]}.
+
+    Uses Finnhub as primary source (ticker-specific, 3-day window) and falls
+    back to NewsAPI per ticker when Finnhub returns nothing.
+    Default window changed from 1 → 3 days to match the single-ticker path.
+    """
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(get_stock_news, t, days): t for t in tickers
+            ex.submit(_fetch_news_one, t, days): t for t in tickers
         }
         for fut in as_completed(futures):
             t = futures[fut]

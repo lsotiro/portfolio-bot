@@ -1,66 +1,4 @@
 {
-  "NIO": {
-    "shares": 38.0,
-    "entry_price": 7.9,
-    "added": "2026-04-28T14:49:27",
-    "analyst_target": 6.661333,
-    "approach_alerted": false,
-    "above_alerted": false,
-    "momentum_score": 48,
-    "peak_price": 7.9,
-    "sector": "Consumer Cyclical",
-    "tightened_stop": true,
-    "atr_pct": 4.6,
-    "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-04-29",
-    "tightened_stop_price": 7.11,
-    "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 48
-      },
-      {
-        "date": "2026-04-30",
-        "score": 48
-      },
-      {
-        "date": "2026-05-01",
-        "score": 48
-      }
-    ],
-    "last_signal": "SELL"
-  },
-  "NVDA": {
-    "shares": 3.0,
-    "entry_price": 174.92,
-    "added": "2026-04-28T14:50:54",
-    "partial_alerted": true,
-    "analyst_target": 268.6148,
-    "approach_alerted": false,
-    "above_alerted": false,
-    "momentum_score": 55,
-    "peak_price": 213.17,
-    "sector": "Technology",
-    "tightened_stop": false,
-    "atr_pct": 2.68,
-    "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29",
-    "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 75
-      },
-      {
-        "date": "2026-04-30",
-        "score": 55
-      },
-      {
-        "date": "2026-05-01",
-        "score": 55
-      }
-    ],
-    "last_signal": "HOLD"
-  },
   "SCHW": {
     "shares": 4.0,
     "entry_price": 90.84,
@@ -68,7 +6,7 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 42,
+    "momentum_score": 35,
     "peak_price": 90.84,
     "sector": "Financial Services",
     "tightened_stop": true,
@@ -87,6 +25,10 @@
       {
         "date": "2026-05-01",
         "score": 42
+      },
+      {
+        "date": "2026-05-05",
+        "score": 35
       }
     ],
     "last_signal": "WATCH",
@@ -99,8 +41,8 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 65,
-    "peak_price": 417.43,
+    "momentum_score": 67,
+    "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
     "atr_pct": 3.2,
@@ -118,6 +60,33 @@
       {
         "date": "2026-05-01",
         "score": 65
+      },
+      {
+        "date": "2026-05-05",
+        "score": 67
+      }
+    ],
+    "last_signal": "BUY"
+  },
+  "ORCL": {
+    "shares": 2.0,
+    "entry_price": 186.0,
+    "added": "2026-05-05T19:31:11",
+    "analyst_target": 241.57605,
+    "approach_alerted": false,
+    "above_alerted": false,
+    "peak_price": 186.19,
+    "sector": "Technology",
+    "atr_pct": 4.89,
+    "atr_stop_pct": -10.0,
+    "atr_last_calc": "2026-05-05",
+    "tightened_stop": false,
+    "monthly_buy_date": null,
+    "momentum_score": 75,
+    "score_history": [
+      {
+        "date": "2026-05-05",
+        "score": 75
       }
     ],
     "last_signal": "BUY"
