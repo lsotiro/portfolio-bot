@@ -1131,21 +1131,36 @@ def sentiment_label(score):
     return "🟡 neutral"
 
 
-def get_stock_news(ticker, days=1, page_size=5):
-    """Fetch the most recent NewsAPI headlines for a ticker.
+def get_stock_news(ticker, days=3, page_size=10):
+    """Fetch recent NewsAPI headlines for a ticker.
 
-    Each article dict carries a `sentiment` field (-1 / 0 / +1) computed
-    from the headline via the keyword heuristic above.
+    Queries both the ticker symbol AND company name to maximise recall.
+    Each article dict carries:
+      title, description, source, publishedAt, url, sentiment
 
-    Returns a list of dicts: [{title, source, publishedAt, url, sentiment}].
-    Empty list on any error or if NEWS_API_KEY is missing.
+    Returns a list of dicts. Empty list on any error or missing key.
     """
     if not NEWS_API_KEY:
         return []
-    # NewsAPI accepts ISO-8601 'from' timestamps. Use UTC `days` ago.
+    # Use a broader query: ticker symbol plus common name variants.
+    # e.g. "ORCL" alone rarely matches; "ORCL OR Oracle" is far more effective.
+    _COMPANY_NAMES = {
+        "ORCL": "Oracle", "MSFT": "Microsoft", "AAPL": "Apple",
+        "GOOGL": "Alphabet", "GOOG": "Alphabet", "AMZN": "Amazon",
+        "META": "Meta", "NVDA": "NVIDIA", "TSLA": "Tesla",
+        "AMD": "AMD", "INTC": "Intel", "CRM": "Salesforce",
+        "ADBE": "Adobe", "NOW": "ServiceNow", "SNOW": "Snowflake",
+        "PLTR": "Palantir", "UBER": "Uber", "LYFT": "Lyft",
+        "NFLX": "Netflix", "DIS": "Disney", "JPM": "JPMorgan",
+        "GS": "Goldman", "BAC": "Bank of America", "V": "Visa",
+        "MA": "Mastercard", "PYPL": "PayPal", "SQ": "Block",
+    }
+    company = _COMPANY_NAMES.get(ticker.upper())
+    query = f'"{ticker}" OR "{company}"' if company else f'"{ticker}"'
+
     from_dt = datetime.utcnow() - timedelta(days=days)
     params = {
-        "q": ticker,
+        "q": query,
         "language": "en",
         "sortBy": "publishedAt",
         "pageSize": page_size,
@@ -1155,22 +1170,80 @@ def get_stock_news(ticker, days=1, page_size=5):
     try:
         r = requests.get(NEWS_ENDPOINT, params=params, timeout=10)
         if r.status_code != 200:
+            print(f"[newsapi {ticker}] HTTP {r.status_code}: {r.text[:120]}")
             return []
         data = r.json()
-    except Exception:
+    except Exception as exc:
+        print(f"[newsapi {ticker}] request failed: {exc}")
         return []
     out = []
     for art in (data.get("articles") or [])[:page_size]:
         title = (art.get("title") or "").strip()
+        desc = (art.get("description") or "").strip()
         out.append(
             {
                 "title": title,
+                "description": desc,
                 "source": (art.get("source") or {}).get("name", ""),
                 "publishedAt": art.get("publishedAt", "")[:10],
                 "url": art.get("url", ""),
                 "sentiment": headline_sentiment(title),
             }
         )
+    print(
+        f"[newsapi {ticker}] query={query!r}  days={days}  "
+        f"returned={len(out)} articles"
+    )
+    return out
+
+
+def get_finnhub_news(ticker, days=3):
+    """Fetch company news from Finnhub (primary news source for scoring).
+
+    Finnhub /company-news returns articles with `headline` and `summary`.
+    We normalise them to {title, description, source, publishedAt} so that
+    `_news_keyword_score` can process them identically to NewsAPI articles.
+
+    Returns a list of normalised dicts. Empty list on any error / missing key.
+    """
+    if not FINNHUB_API_KEY:
+        return []
+    from_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = datetime.utcnow().strftime("%Y-%m-%d")
+    url = (
+        f"https://finnhub.io/api/v1/company-news"
+        f"?symbol={ticker}&from={from_date}&to={to_date}"
+        f"&token={FINNHUB_API_KEY}"
+    )
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            print(f"[finnhub-news {ticker}] HTTP {r.status_code}: {r.text[:120]}")
+            return []
+        data = r.json()
+    except Exception as exc:
+        print(f"[finnhub-news {ticker}] request failed: {exc}")
+        return []
+    out = []
+    for art in (data or [])[:20]:          # cap at 20 — plenty for sentiment
+        headline = (art.get("headline") or "").strip()
+        summary  = (art.get("summary")  or "").strip()
+        if not headline:
+            continue
+        out.append(
+            {
+                "title": headline,
+                "description": summary,
+                "source": art.get("source", ""),
+                "publishedAt": str(art.get("datetime", ""))[:10],
+                "url": art.get("url", ""),
+                "sentiment": headline_sentiment(headline),
+            }
+        )
+    print(
+        f"[finnhub-news {ticker}] days={days}  raw={len(data)}  "
+        f"normalised={len(out)}"
+    )
     return out
 
 
@@ -1929,16 +2002,54 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
             details["vol_ratio"] = None
 
         # ── News sentiment (20 pts) ─────────────────────────────────────
+        # Primary: Finnhub /company-news (ticker-specific, 20 articles, 3 days).
+        # Fallback: NewsAPI (broader query with company name alias, 10 articles).
+        # Both sources normalise to {title, description} so _news_keyword_score
+        # works identically on either.
         if news_articles is None:
             try:
-                news_articles = get_stock_news(ticker, days=1, page_size=10)
+                news_articles = get_finnhub_news(ticker, days=3)
+                if not news_articles:
+                    print(
+                        f"[momentum {ticker}] Finnhub news empty, "
+                        "falling back to NewsAPI"
+                    )
+                    news_articles = get_stock_news(ticker, days=3, page_size=10)
             except Exception as exc:
                 print(f"[momentum {ticker}] news fetch failed: {exc}")
                 news_articles = []
+
         news_score, news_label = _news_keyword_score(news_articles or [])
+
+        # Detailed log so every run is auditable
+        _pos = sum(
+            1 for a in (news_articles or [])
+            if any(
+                w in ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+                for w in _POSITIVE_NEWS
+            )
+        )
+        _neg = sum(
+            1 for a in (news_articles or [])
+            if any(
+                w in ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+                for w in _NEGATIVE_NEWS
+            )
+        )
+        print(
+            f"[momentum {ticker}] news  articles={len(news_articles or [])}  "
+            f"pos={_pos}  neg={_neg}  score={news_score}/20  label={news_label!r}"
+        )
+        if news_articles:
+            for _a in (news_articles or [])[:5]:
+                print(
+                    f"  headline: {(_a.get('title') or '')[:72]}"
+                )
+
         score += news_score
         details["news"] = news_label
         details["news_score"] = news_score
+        details["_news_article_count"] = len(news_articles or [])
 
         # ── Earnings momentum (15 pts) ──────────────────────────────────
         # 8 pts: beat last quarter EPS estimate (Finnhub primary, yfinance fallback)
