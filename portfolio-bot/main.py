@@ -5621,6 +5621,25 @@ schedule.every().minute.do(_flexible_daily_delivery)
 # Boot everything (only when run as a script, NOT when imported)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # ── PID-file guard: prevent two instances running simultaneously ──────
+    # Replit restarts can leave a zombie process still holding the port and
+    # the Telegram polling connection. Writing our PID to a lockfile and
+    # killing any previous owner ensures only one instance runs at a time.
+    _PID_FILE = "/tmp/portfolio_bot.pid"
+    try:
+        if os.path.exists(_PID_FILE):
+            _old_pid = int(open(_PID_FILE).read().strip())
+            if _old_pid != os.getpid():
+                try:
+                    os.kill(_old_pid, 9)   # SIGKILL — no grace period needed
+                    print(f"[boot] killed stale instance PID {_old_pid}")
+                except ProcessLookupError:
+                    pass  # already gone
+        with open(_PID_FILE, "w") as _f:
+            _f.write(str(os.getpid()))
+    except Exception as _e:
+        print(f"[boot] PID guard warning: {_e}")
+
     # ── Thread 1: Flask web server (portfolio summary + /ping) on port 8080
     t_web = Thread(target=keep_alive, daemon=True, name="web-server")
     t_web.start()
