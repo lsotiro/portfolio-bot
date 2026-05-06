@@ -3700,6 +3700,7 @@ def _handle_portfolio_inner(chat_id, scheduled=False):
         send_telegram(msl, chat_id)
 
     portfolio = load_portfolio()
+    print(f"[/portfolio] loaded portfolio tickers: {list(portfolio.keys())}")
     if not portfolio:
         send_telegram(
             "Your portfolio is empty. Use /buy TICKER SHARES PRICE to add one.",
