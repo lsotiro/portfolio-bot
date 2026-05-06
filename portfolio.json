@@ -41,7 +41,7 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 67,
+    "momentum_score": 77,
     "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
@@ -63,7 +63,7 @@
       },
       {
         "date": "2026-05-05",
-        "score": 67
+        "score": 77
       }
     ],
     "last_signal": "BUY"
