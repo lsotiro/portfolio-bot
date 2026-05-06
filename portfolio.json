@@ -6,13 +6,13 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 35,
+    "momentum_score": 45,
     "peak_price": 90.84,
     "sector": "Financial Services",
     "tightened_stop": true,
-    "atr_pct": 3.19,
+    "atr_pct": 2.89,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29",
+    "atr_last_calc": "2026-05-06",
     "score_history": [
       {
         "date": "2026-04-29",
@@ -29,6 +29,10 @@
       {
         "date": "2026-05-05",
         "score": 35
+      },
+      {
+        "date": "2026-05-06",
+        "score": 45
       }
     ],
     "last_signal": "WATCH",
@@ -45,9 +49,9 @@
     "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
-    "atr_pct": 3.2,
+    "atr_pct": 3.0,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-04-29",
+    "atr_last_calc": "2026-05-06",
     "score_history": [
       {
         "date": "2026-04-29",
@@ -63,6 +67,10 @@
       },
       {
         "date": "2026-05-05",
+        "score": 77
+      },
+      {
+        "date": "2026-05-06",
         "score": 77
       }
     ],
@@ -86,6 +94,10 @@
     "score_history": [
       {
         "date": "2026-05-05",
+        "score": 75
+      },
+      {
+        "date": "2026-05-06",
         "score": 75
       }
     ],

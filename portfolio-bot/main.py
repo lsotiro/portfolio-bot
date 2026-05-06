@@ -764,12 +764,39 @@ def send_telegram(message, chat_id, parse_mode="Markdown"):
     """Send a message to a Telegram chat. Pass parse_mode=None for plain
     text — the unified /portfolio per-position messages do this so that
     Claude-generated reason text containing `_`, `*`, `[` etc. cannot
-    cause Telegram to silently reject the message (`ok: false`)."""
+    cause Telegram to silently reject the message (`ok: false`).
+
+    Retries up to 3 times on network errors with a 2-second back-off.
+    Errors are always logged and never propagated — daemon threads must
+    not crash silently on a transient Telegram connectivity blip.
+    """
+    import time as _time
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
-    requests.post(url, json=payload, timeout=30)
+    snippet = str(message)[:80].replace("\n", " ")
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            try:
+                rj = resp.json()
+                if not rj.get("ok"):
+                    print(f"[telegram] attempt {attempt} FAILED ok=false: {rj.get('description')} | msg={snippet!r}")
+                    # 429 = rate-limited → wait and retry; other errors → give up
+                    if rj.get("error_code") == 429:
+                        retry_after = rj.get("parameters", {}).get("retry_after", 5)
+                        _time.sleep(retry_after)
+                        continue
+                    return  # non-retriable API error
+            except Exception:
+                pass
+            return  # success (or unparse-able response — assume delivered)
+        except Exception as exc:
+            print(f"[telegram] attempt {attempt} network error: {exc} | msg={snippet!r}")
+            if attempt < 3:
+                _time.sleep(2)
+    print(f"[telegram] all 3 attempts failed for msg={snippet!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -3644,6 +3671,24 @@ def handle_portfolio(chat_id, scheduled=False):
     Yesterday's score is read from ``portfolio[ticker]['momentum_score']``
     and the new score is written back at the end of every run.
     """
+    try:
+        _handle_portfolio_inner(chat_id, scheduled=scheduled)
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[/portfolio] UNCAUGHT CRASH:\n{tb}")
+        try:
+            send_telegram(
+                f"❌ /portfolio crashed internally — please try again.\n"
+                f"Error: {exc}",
+                chat_id,
+                parse_mode=None,
+            )
+        except Exception:
+            pass
+
+
+def _handle_portfolio_inner(chat_id, scheduled=False):
     # Show market status at the top of every portfolio view.
     msl = market_status_line()
     if not is_trading_day():
@@ -3911,8 +3956,10 @@ def handle_portfolio(chat_id, scheduled=False):
             print(f"[/portfolio] transition alert failed: {exc}")
 
     # ── Single batched Claude call → one-sentence momentum reason ──────
+    print(f"[/portfolio] {len(records)} records built, calling _get_quick_reasons")
     judged = [r for r in records if r["score"] is not None]
     reasons = _get_quick_reasons(judged)
+    print(f"[/portfolio] reasons returned: {list(reasons.keys())}")
     for r in records:
         r["reason"] = reasons.get(
             r["ticker"],
@@ -3922,6 +3969,7 @@ def handle_portfolio(chat_id, scheduled=False):
             ),
         )
 
+    print(f"[/portfolio] reasons assigned, scheduled={scheduled}")
     # ── Scheduled-only urgent alerts (sent BEFORE the main report) ─────
     if scheduled:
         for r in records:
@@ -3986,9 +4034,11 @@ def handle_portfolio(chat_id, scheduled=False):
     # ── Sort: 🔴 first, 🟡 second, 🟢 last ────────────────────────────
     color_order = {"🔴": 0, "🟡": 1, "🟢": 2}
     records.sort(key=lambda r: (color_order.get(r["color"], 9), r["ticker"]))
+    print(f"[/portfolio] sorted {len(records)} records, entering message-send loop")
 
     # ── Send ONE Telegram message per position with full momentum block ─
     for r in records:
+        print(f"[/portfolio] sending message for {r['ticker']} signal={r['signal']}")
         d = r.get("details") or {}
         score_str = f"{r['score']}/100" if r["score"] is not None else "n/a"
 
@@ -4097,30 +4147,35 @@ def handle_portfolio(chat_id, scheduled=False):
             )
 
         # Spec format: full momentum breakdown then position math then reason.
-        _send_chunked(
-            f"{r['color']} {r['ticker']} — {r['signal']}\n"
-            f"{sector_line}"
-            f"Momentum Score: {score_str}\n"
-            f"{stability_line}"
-            f"{protection_line}"
-            f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
-            f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
-            f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
-            f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
-            f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
-            f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
-            f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n"
-            f"News: {d.get('news', 'n/a')}\n"
-            f"Earnings: "
-            f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
-            f"{trigger_line}"
-            f"{pl_line}\n"
-            f"{target_line}\n"
-            f"{stop_line}\n"
-            f"{r['reason']}",
-            chat_id,
-            parse_mode=None,
-        )
+        try:
+            _send_chunked(
+                f"{r['color']} {r['ticker']} — {r['signal']}\n"
+                f"{sector_line}"
+                f"Momentum Score: {score_str}\n"
+                f"{stability_line}"
+                f"{protection_line}"
+                f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+                f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
+                f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
+                f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
+                f"vs SPY {_fmt_signed_pct(d.get('spy_ret_4w'))} → "
+                f"RS: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
+                f"Volume: {_vol_label(d.get('rvol'), d.get('rvol_up_day'))}\n"
+                f"News: {d.get('news', 'n/a')}\n"
+                f"Earnings: "
+                f"{_earnings_label(d.get('earnings_beat'), d.get('estimates_rising'))}\n"
+                f"{trigger_line}"
+                f"{pl_line}\n"
+                f"{target_line}\n"
+                f"{stop_line}\n"
+                f"{r['reason']}",
+                chat_id,
+                parse_mode=None,
+            )
+            print(f"[/portfolio] sent message for {r['ticker']}")
+        except Exception as exc:
+            import traceback
+            print(f"[/portfolio] message build/send FAILED for {r['ticker']}: {exc}\n{traceback.format_exc()}")
 
     # ── Final summary message — bucketed by signal per spec ────────────
     priced = [r for r in records if r["current"] is not None]
