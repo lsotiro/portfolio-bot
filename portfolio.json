@@ -6,7 +6,7 @@
     "analyst_target": 115.2,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 45,
+    "momentum_score": 15,
     "peak_price": 90.84,
     "sector": "Financial Services",
     "tightened_stop": true,
@@ -14,10 +14,6 @@
     "atr_stop_pct": -7.0,
     "atr_last_calc": "2026-05-06",
     "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 35
-      },
       {
         "date": "2026-04-30",
         "score": 35
@@ -33,6 +29,10 @@
       {
         "date": "2026-05-06",
         "score": 45
+      },
+      {
+        "date": "2026-05-07",
+        "score": 15
       }
     ],
     "last_signal": "WATCH",
@@ -45,7 +45,7 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 77,
+    "momentum_score": 67,
     "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
@@ -53,10 +53,6 @@
     "atr_stop_pct": -7.0,
     "atr_last_calc": "2026-05-06",
     "score_history": [
-      {
-        "date": "2026-04-29",
-        "score": 65
-      },
       {
         "date": "2026-04-30",
         "score": 65
@@ -72,6 +68,10 @@
       {
         "date": "2026-05-06",
         "score": 77
+      },
+      {
+        "date": "2026-05-07",
+        "score": 67
       }
     ],
     "last_signal": "BUY"
@@ -83,7 +83,7 @@
     "analyst_target": 241.57605,
     "approach_alerted": false,
     "above_alerted": false,
-    "peak_price": 186.19,
+    "peak_price": 193.505,
     "sector": "Technology",
     "atr_pct": 4.89,
     "atr_stop_pct": -10.0,
@@ -99,8 +99,28 @@
       {
         "date": "2026-05-06",
         "score": 75
+      },
+      {
+        "date": "2026-05-07",
+        "score": 75
       }
     ],
     "last_signal": "BUY"
+  },
+  "APP": {
+    "shares": 1.0,
+    "entry_price": 498.08,
+    "added": "2026-05-07T19:25:49",
+    "analyst_target": 639.5714,
+    "approach_alerted": false,
+    "above_alerted": false,
+    "peak_price": 498.08,
+    "sector": "Communication Services",
+    "atr_pct": 5.26,
+    "atr_stop_pct": -10.0,
+    "atr_last_calc": "2026-05-07",
+    "tightened_stop": false,
+    "monthly_buy_date": null,
+    "momentum_score": 90
   }
 }
