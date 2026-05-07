@@ -1,43 +1,4 @@
 {
-  "SCHW": {
-    "shares": 4.0,
-    "entry_price": 90.84,
-    "added": "2026-04-28T15:37:16",
-    "analyst_target": 115.2,
-    "approach_alerted": false,
-    "above_alerted": false,
-    "momentum_score": 15,
-    "peak_price": 90.84,
-    "sector": "Financial Services",
-    "tightened_stop": true,
-    "atr_pct": 2.89,
-    "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-05-06",
-    "score_history": [
-      {
-        "date": "2026-04-30",
-        "score": 35
-      },
-      {
-        "date": "2026-05-01",
-        "score": 42
-      },
-      {
-        "date": "2026-05-05",
-        "score": 35
-      },
-      {
-        "date": "2026-05-06",
-        "score": 45
-      },
-      {
-        "date": "2026-05-07",
-        "score": 15
-      }
-    ],
-    "last_signal": "WATCH",
-    "tightened_stop_price": 87.97
-  },
   "AVGO": {
     "shares": 2.0,
     "entry_price": 396.28,
@@ -121,6 +82,13 @@
     "atr_last_calc": "2026-05-07",
     "tightened_stop": false,
     "monthly_buy_date": null,
-    "momentum_score": 90
+    "momentum_score": 100,
+    "score_history": [
+      {
+        "date": "2026-05-07",
+        "score": 100
+      }
+    ],
+    "last_signal": "STRONG BUY"
   }
 }
