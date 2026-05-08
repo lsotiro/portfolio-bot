@@ -6,7 +6,7 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 67,
+    "momentum_score": 77,
     "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
@@ -14,10 +14,6 @@
     "atr_stop_pct": -7.0,
     "atr_last_calc": "2026-05-06",
     "score_history": [
-      {
-        "date": "2026-04-30",
-        "score": 65
-      },
       {
         "date": "2026-05-01",
         "score": 65
@@ -33,6 +29,10 @@
       {
         "date": "2026-05-07",
         "score": 67
+      },
+      {
+        "date": "2026-05-08",
+        "score": 77
       }
     ],
     "last_signal": "BUY"
@@ -44,7 +44,7 @@
     "analyst_target": 241.57605,
     "approach_alerted": false,
     "above_alerted": false,
-    "peak_price": 193.505,
+    "peak_price": 196.0,
     "sector": "Technology",
     "atr_pct": 4.89,
     "atr_stop_pct": -10.0,
@@ -64,6 +64,10 @@
       {
         "date": "2026-05-07",
         "score": 75
+      },
+      {
+        "date": "2026-05-08",
+        "score": 75
       }
     ],
     "last_signal": "BUY"
@@ -82,13 +86,17 @@
     "atr_last_calc": "2026-05-07",
     "tightened_stop": false,
     "monthly_buy_date": null,
-    "momentum_score": 100,
+    "momentum_score": 55,
     "score_history": [
       {
         "date": "2026-05-07",
         "score": 100
+      },
+      {
+        "date": "2026-05-08",
+        "score": 55
       }
     ],
-    "last_signal": "STRONG BUY"
+    "last_signal": "HOLD"
   }
 }
