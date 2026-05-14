@@ -65,7 +65,7 @@ import schedule
 import yfinance as yf
 from flask import Flask
 from watchlist import score_watchlist
-from watchlist_tracker import add_to_watchlist, update_consecutive_days, get_buy_alerts
+from watchlist_tracker import add_to_watchlist, update_consecutive_days, get_buy_alerts, load_watchlist
 from weekly_scanner import run_weekly_scan
 from daily_watchlist_check import run_daily_check
 from momentum_engine import (
@@ -3789,6 +3789,7 @@ def handle_start(chat_id):
         "`/trim TICKER` — sell 50% of a position (quick partial exit)\n"
         "`/portfolio` — momentum-scored daily view (one msg per position + summary)\n"
         "`/cash` — total value, invested, idle cash + treasury suggestion\n"
+        "`/watchlist` — stocks under watch (score, streak, date added)\n"
         "`/health` — portfolio health score (0–10) + sector breakdown\n"
         "`/earnings` — upcoming earnings dates (next 30 days)\n"
         "`/deep TICKER` — full momentum analysis on any stock\n"
@@ -3877,6 +3878,8 @@ def poll_telegram():
                             args=(chat_id,),
                             daemon=True,
                         ).start()
+                    elif cmd == "/watchlist":
+                        handle_watchlist(chat_id)
                     elif cmd == "/health":
                         send_telegram(
                             "Analyzing… please wait", chat_id,
@@ -4212,6 +4215,24 @@ def format_health_breakdown(report):
             flag = " ⚠️ at cap" if n >= MAX_POSITIONS_PER_SECTOR else ""
             lines.append(f"• {sec}: {n}{flag}")
     return "\n".join(lines)
+
+
+def handle_watchlist(chat_id):
+    """`/watchlist` — show every stock currently on the watchlist."""
+    watchlist = load_watchlist()
+    if not watchlist:
+        send_telegram(
+            "No stocks on watchlist yet — next scan runs Monday 07:00 UTC",
+            chat_id,
+        )
+        return
+    lines = ["*Watchlist*\n"]
+    for ticker, data in sorted(watchlist.items()):
+        score = data.get("last_score", "—")
+        days = data.get("consecutive_days", 0)
+        added = data.get("added_date", "—")
+        lines.append(f"*{ticker}* — score: {score}  streak: {days}d  added: {added}")
+    send_telegram("\n".join(lines), chat_id)
 
 
 def handle_health(chat_id):
