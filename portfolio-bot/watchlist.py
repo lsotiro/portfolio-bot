@@ -1,6 +1,3 @@
-from main import score_momentum_bulk
-
-
 def score_watchlist(tickers):
     """Score a list of tickers and return those with momentum score >= 65.
 
@@ -9,6 +6,7 @@ def score_watchlist(tickers):
     if not tickers:
         return []
 
+    from momentum_engine import score_momentum_bulk
     results = score_momentum_bulk(tickers)
 
     qualifying = [

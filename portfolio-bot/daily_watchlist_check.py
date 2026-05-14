@@ -1,4 +1,3 @@
-from main import score_momentum_bulk
 from watchlist_tracker import (
     get_buy_alerts,
     load_watchlist,
@@ -31,6 +30,7 @@ def run_daily_check():
     tickers = list(watchlist.keys())
     print(f"[daily-watchlist] scoring {len(tickers)} watchlist tickers...")
 
+    from momentum_engine import score_momentum_bulk
     score_map = score_momentum_bulk(tickers)
     print(f"[daily-watchlist] scores returned for {len(score_map)} tickers")
 
