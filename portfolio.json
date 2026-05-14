@@ -6,18 +6,14 @@
     "analyst_target": 475.49295,
     "approach_alerted": false,
     "above_alerted": false,
-    "momentum_score": 77,
+    "momentum_score": 55,
     "peak_price": 430.14,
     "sector": "Technology",
     "tightened_stop": false,
-    "atr_pct": 3.0,
+    "atr_pct": 3.74,
     "atr_stop_pct": -7.0,
-    "atr_last_calc": "2026-05-06",
+    "atr_last_calc": "2026-05-13",
     "score_history": [
-      {
-        "date": "2026-05-01",
-        "score": 65
-      },
       {
         "date": "2026-05-05",
         "score": 77
@@ -33,9 +29,13 @@
       {
         "date": "2026-05-08",
         "score": 77
+      },
+      {
+        "date": "2026-05-13",
+        "score": 55
       }
     ],
-    "last_signal": "BUY"
+    "last_signal": "HOLD"
   },
   "ORCL": {
     "shares": 2.0,
@@ -46,12 +46,12 @@
     "above_alerted": false,
     "peak_price": 196.0,
     "sector": "Technology",
-    "atr_pct": 4.89,
+    "atr_pct": 4.67,
     "atr_stop_pct": -10.0,
-    "atr_last_calc": "2026-05-05",
+    "atr_last_calc": "2026-05-13",
     "tightened_stop": false,
     "monthly_buy_date": null,
-    "momentum_score": 75,
+    "momentum_score": 55,
     "score_history": [
       {
         "date": "2026-05-05",
@@ -68,9 +68,13 @@
       {
         "date": "2026-05-08",
         "score": 75
+      },
+      {
+        "date": "2026-05-13",
+        "score": 55
       }
     ],
-    "last_signal": "BUY"
+    "last_signal": "HOLD"
   },
   "APP": {
     "shares": 1.0,
@@ -84,9 +88,9 @@
     "atr_pct": 5.26,
     "atr_stop_pct": -10.0,
     "atr_last_calc": "2026-05-07",
-    "tightened_stop": false,
+    "tightened_stop": true,
     "monthly_buy_date": null,
-    "momentum_score": 55,
+    "momentum_score": 35,
     "score_history": [
       {
         "date": "2026-05-07",
@@ -95,8 +99,13 @@
       {
         "date": "2026-05-08",
         "score": 55
+      },
+      {
+        "date": "2026-05-13",
+        "score": 35
       }
     ],
-    "last_signal": "HOLD"
+    "last_signal": "WATCH",
+    "tightened_stop_price": 448.27
   }
 }

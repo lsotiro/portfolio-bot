@@ -64,6 +64,10 @@ import requests
 import schedule
 import yfinance as yf
 from flask import Flask
+from watchlist import score_watchlist
+from watchlist_tracker import add_to_watchlist, update_consecutive_days, get_buy_alerts
+from weekly_scanner import run_weekly_scan
+from daily_watchlist_check import run_daily_check
 
 BOT_VERSION = "2.0"
 BOT_VERSION_LABEL = "Portfolio Bot v2.0 - Momentum System"
@@ -5661,6 +5665,67 @@ def _send_no_replacement(chat_id, top_score=None):
     _send_chunked("\n".join(parts), chat_id)
 
 
+def _scheduled_daily_watchlist_check():
+    """Daily 08:00 UTC — score watchlist stocks and send Telegram BUY alerts."""
+    if _skip_if_not_trading_day("watchlist-check"):
+        return
+    chat_id = recall_chat()
+    if chat_id is None:
+        print("[watchlist-check] no chat has interacted yet — skipping")
+        return
+    print("[watchlist-check] running daily watchlist check")
+    try:
+        alerts = run_daily_check()
+    except Exception as exc:
+        print(f"[watchlist-check] run_daily_check failed: {exc}")
+        return
+
+    for alert in alerts:
+        try:
+            ticker = alert["ticker"]
+            score = alert["score"]
+            consecutive_days = alert["consecutive_days"]
+            details = alert.get("details") or {}
+
+            current_px = get_current_price(ticker)
+            price_str = f"${current_px:.2f}" if current_px else "n/a"
+
+            target = _safe_target(details.get("_target_price"))
+            target_str = f"${target:.2f}" if target else "n/a"
+
+            atr_pct, _ = calculate_atr(ticker)
+            atr_stop_pct = get_atr_stop_pct(atr_pct)
+            if current_px:
+                stop_px = current_px * (1.0 + atr_stop_pct / 100.0)
+                stop_str = f"${stop_px:.2f}"
+            else:
+                stop_str = "n/a"
+
+            rs_str = _fmt_signed_pct(details.get("rs_vs_spy"))
+            rvol = details.get("rvol")
+            rvol_str = f"{rvol:.2f}" if rvol is not None else "n/a"
+            earnings_str = _earnings_label(
+                details.get("earnings_beat"),
+                details.get("estimates_rising"),
+            )
+
+            send_telegram(
+                f"💡 BUY ALERT — {ticker} (Day {consecutive_days} of confirmation)\n"
+                f"Momentum Score: {score}/100\n"
+                f"Price: {price_str} | Target: {target_str} | Stop: {stop_str}\n"
+                f"RS vs SPY: {rs_str} | RVOL: {rvol_str}x\n"
+                f"Earnings: {earnings_str}\n"
+                f"Signal confirmed for {consecutive_days} consecutive days ✅",
+                chat_id,
+                parse_mode=None,
+            )
+        except Exception as exc:
+            print(
+                f"[watchlist-check] alert send failed for "
+                f"{alert.get('ticker')}: {exc}"
+            )
+
+
 schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
@@ -5671,6 +5736,8 @@ schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
 # A per-minute poller fires scheduled_run() when the clock matches the
 # configured delivery_time_utc, so time changes take effect immediately.
 schedule.every().minute.do(_flexible_daily_delivery)
+schedule.every().monday.at("07:00").do(run_weekly_scan)
+schedule.every().day.at("08:00").do(_scheduled_daily_watchlist_check)
 
 
 # ---------------------------------------------------------------------------
