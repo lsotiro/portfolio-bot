@@ -1775,7 +1775,7 @@ def _format_momentum_for_prompt(records):
         lines.append(
             f"- {r['ticker']}: signal={r['signal']}, "
             f"score={r.get('score', 'n/a')}/100, "
-            f"1w={d.get('ret_1w', 'n/a')}%, 4w={d.get('ret_4w', 'n/a')}%, "
+            f"6m={d.get('ret_6m', 'n/a')}%, 4w={d.get('ret_4w', 'n/a')}%, "
             f"12w={d.get('ret_12w', 'n/a')}%, "
             f"RS={d.get('rs_vs_spy', 'n/a')}%, "
             f"volRatio={d.get('vol_ratio', 'n/a')}, "
@@ -2028,7 +2028,7 @@ def run_monthly_screen(chat_id):
         send_telegram(
             f"{color} {t} — {signal}\n"
             f"Momentum Score: {score}/100\n"
-            f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+            f"Price: 6M {_fmt_signed_pct(d.get('ret_6m'))} | "
             f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
             f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
             f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
@@ -3576,7 +3576,7 @@ def _handle_portfolio_inner(chat_id, scheduled=False):
                 f"Momentum Score: {score_str}\n"
                 f"{stability_line}"
                 f"{protection_line}"
-                f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+                f"Price: 6M {_fmt_signed_pct(d.get('ret_6m'))} | "
                 f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
                 f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
                 f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
@@ -3710,7 +3710,7 @@ def handle_deep(args, chat_id):
             # Build the base stats block (shown regardless of DQ status).
             stats_block = (
                 f"Momentum Score: {score}/100\n"
-                f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+                f"Price: 6M {_fmt_signed_pct(d.get('ret_6m'))} | "
                 f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
                 f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
                 f"vs S&P 500 (4W): Stock {_fmt_signed_pct(d.get('ret_4w'))} "
@@ -5069,7 +5069,7 @@ def find_replacement_after_exit(chat_id, exclude=None):
         f"🟢 *{ticker}* — Score {score}/100 (BUY)\n"
         f"Sector: {sector}\n"
         f"{price_line}{upside_line}\n"
-        f"Price: 1W {_fmt_signed_pct(d.get('ret_1w'))} | "
+        f"Price: 6M {_fmt_signed_pct(d.get('ret_6m'))} | "
         f"4W {_fmt_signed_pct(d.get('ret_4w'))} | "
         f"12W {_fmt_signed_pct(d.get('ret_12w'))}\n"
         f"RS vs SPY: {_fmt_signed_pct(d.get('rs_vs_spy'))}\n"
