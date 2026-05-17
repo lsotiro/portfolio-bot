@@ -375,6 +375,19 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
         details["rs_vs_spy"] = round(rs * 100, 1)
         details["spy_ret_4w"] = round(spy_ret_4w * 100, 1)
 
+        # ── Momentum consistency (15 pts) ────────────────────────────────
+        last_126 = hist.tail(126)
+        total_days = len(last_126)
+        positive_days = int((last_126["Close"] > last_126["Open"]).sum())
+        consistency_pct = (positive_days / total_days * 100) if total_days > 0 else 0.0
+        if consistency_pct > 60:
+            score += 15
+        elif consistency_pct >= 55:
+            score += 8
+        elif consistency_pct >= 50:
+            score += 4
+        details["consistency_pct"] = round(consistency_pct, 1)
+
         # ── Volume confirmation via RVOL (15 pts) ───────────────────────
         # RVOL = today's volume ÷ 20-day average volume. Awards points
         # only on up days (close > open) — institutional buying is what
