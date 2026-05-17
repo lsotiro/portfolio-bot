@@ -408,11 +408,11 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
             vol_score = 0
             if up_day:
                 if rvol > 2.0:
-                    vol_score = 15
-                elif rvol >= 1.5:
                     vol_score = 10
+                elif rvol >= 1.5:
+                    vol_score = 6
                 elif rvol >= 1.0:
-                    vol_score = 7
+                    vol_score = 3
             score += vol_score
 
             details["rvol"] = round(rvol, 2)
