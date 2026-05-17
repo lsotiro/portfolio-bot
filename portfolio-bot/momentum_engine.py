@@ -481,8 +481,9 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
         details["_news_article_count"] = len(news_articles or [])
 
         # ── Earnings momentum (15 pts) ──────────────────────────────────
-        # 8 pts: beat last quarter EPS estimate (Finnhub primary, yfinance fallback)
-        # 7 pts: analyst price target ≥10% above current price
+        # 12 pts: beat last quarter EPS estimate (Finnhub primary, yfinance fallback)
+        # 10 pts: analyst price target ≥10% above current price
+        # +3 pts bonus: both earnings_beat AND estimates_rising (max total 25)
         # Each sub-component is wrapped so one failure never zeroes the other.
         _ts = datetime.utcnow().strftime("%H:%M:%S UTC")
         print(f"[momentum {ticker}] earnings check at {_ts}")
@@ -490,7 +491,7 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
         details["earnings_beat"] = None
         details["estimates_rising"] = None
 
-        # ── 8 pts: EPS beat ─────────────────────────────────────────────
+        # ── 12 pts: EPS beat ────────────────────────────────────────────
         try:
             # PRIMARY: Finnhub (more reliable, real-time consensus data)
             fh_beat, fh_actual, fh_estimate, fh_period = _finnhub_earnings_beat(ticker)
@@ -501,7 +502,7 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
                 details["_earnings_actual"] = fh_actual
                 details["_earnings_estimate"] = fh_estimate
                 if fh_beat:
-                    earnings_score += 8
+                    earnings_score += 12
             else:
                 # FALLBACK: yfinance earnings_history
                 # Uses epsActual / epsEstimate columns (oldest-first, iloc[-1] = newest).
@@ -531,11 +532,11 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
                             f"estimate={yf_estimate}  beat={yf_beat}"
                         )
                         if yf_beat:
-                            earnings_score += 8
+                            earnings_score += 12
         except Exception as exc:
             print(f"[momentum {ticker}] earnings_beat check failed: {exc}")
 
-        # ── 7 pts: analyst target ≥10% upside ───────────────────────────
+        # ── 10 pts: analyst target ≥10% upside ──────────────────────────
         try:
             # Ensure we have a usable info dict (may be None if called standalone)
             _info = info or {}
@@ -570,7 +571,7 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
                 f"qualifies={bool(target and target > current_px * 1.10)}"
             )
             if target and target > current_px * 1.10:
-                earnings_score += 7
+                earnings_score += 10
                 details["estimates_rising"] = True
             else:
                 details["estimates_rising"] = False
@@ -580,6 +581,9 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
             print(f"[momentum {ticker}] price-target check failed: {exc}")
             details["estimates_rising"] = False
 
+        if details.get("earnings_beat") and details.get("estimates_rising"):
+            earnings_score += 3
+        earnings_score = min(earnings_score, 25)
         score += earnings_score
         details["earnings_score"] = earnings_score
         print(
