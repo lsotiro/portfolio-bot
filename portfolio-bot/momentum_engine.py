@@ -329,27 +329,34 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
                 spy_hist = None
 
         current = float(hist["Close"].iloc[-1])
-        week1_ago = float(
-            hist["Close"].iloc[-5] if len(hist) >= 5 else hist["Close"].iloc[0]
-        )
         week4_ago = float(
             hist["Close"].iloc[-20] if len(hist) >= 20 else hist["Close"].iloc[0]
         )
         week12_ago = float(hist["Close"].iloc[0])
+        mo6_ago = float(
+            hist["Close"].iloc[-126] if len(hist) >= 126 else hist["Close"].iloc[0]
+        )
+        mo12_ago = float(
+            hist["Close"].iloc[-252] if len(hist) >= 252 else hist["Close"].iloc[0]
+        )
 
-        # ── Price momentum (30 pts) ─────────────────────────────────────
-        ret_1w = (current - week1_ago) / week1_ago if week1_ago else 0
+        # ── Price momentum (25 pts) ─────────────────────────────────────
         ret_4w = (current - week4_ago) / week4_ago if week4_ago else 0
         ret_12w = (current - week12_ago) / week12_ago if week12_ago else 0
-        if ret_1w > 0:
-            score += 10
+        ret_6m = (current - mo6_ago) / mo6_ago if mo6_ago else 0
+        ret_12m = (current - mo12_ago) / mo12_ago if mo12_ago else 0
         if ret_4w > 0:
-            score += 10
+            score += 5
         if ret_12w > 0:
-            score += 10
-        details["ret_1w"] = round(ret_1w * 100, 1)
+            score += 8
+        if ret_6m > 0:
+            score += 7
+        if ret_12m > 0:
+            score += 5
         details["ret_4w"] = round(ret_4w * 100, 1)
         details["ret_12w"] = round(ret_12w * 100, 1)
+        details["ret_6m"] = round(ret_6m * 100, 1)
+        details["ret_12m"] = round(ret_12m * 100, 1)
 
         # ── Relative strength vs SPY (20 pts) ───────────────────────────
         spy_ret_4w = 0.0
