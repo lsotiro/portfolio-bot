@@ -76,6 +76,8 @@ from momentum_engine import (
     _finnhub_price_target,
     _POSITIVE_NEWS,
     _NEGATIVE_NEWS,
+    get_finnhub_news,
+    get_stock_news,
 )
 
 BOT_VERSION = "2.0"
