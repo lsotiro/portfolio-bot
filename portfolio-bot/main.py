@@ -424,7 +424,7 @@ def save_json(path, data):
 # ---------------------------------------------------------------------------
 _SETTINGS_DEFAULTS = {
     "daily_delivery": True,        # send /portfolio automatically each day
-    "delivery_time_utc": "09:00",  # HH:MM UTC — when to send it
+    "delivery_time_utc": "06:00",  # HH:MM UTC — when to send it
     "timezone_display": "ET",      # label shown in market status lines
 }
 
@@ -5167,12 +5167,12 @@ def _scheduled_daily_watchlist_check():
             )
 
 
-schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
-schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
+schedule.every().day.at("04:30", "UTC").do(scheduled_recommendation_review)
+schedule.every().day.at("05:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
 # Pre-market gap-down sweep — runs alongside the earnings/weekly sweep.
 schedule.every().day.at("04:00", "UTC").do(check_gap_down)
-schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
+schedule.every().day.at("05:30", "UTC").do(scheduled_health_check)
 # Daily portfolio delivery — time is user-configurable via /settings.
 # A per-minute poller fires scheduled_run() when the clock matches the
 # configured delivery_time_utc, so time changes take effect immediately.
