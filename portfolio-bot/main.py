@@ -3700,6 +3700,29 @@ def handle_deep(args, chat_id):
             target = _safe_target((info or {}).get("targetMeanPrice"))
 
             d = details
+
+            # Earnings proximity warning
+            earnings_warning = ""
+            try:
+                nxt_earnings = get_next_earnings(ticker)
+                if nxt_earnings is not None:
+                    days_until = nxt_earnings["days_until"]
+                    earn_date = nxt_earnings["report_date"].strftime("%b %d")
+                    if days_until <= 3:
+                        earnings_warning = (
+                            f"\n🚨 EARNINGS IN {days_until} DAYS ({earn_date}) — "
+                            f"do NOT enter now. Binary risk. Wait until after "
+                            f"{earn_date} report, then reassess."
+                        )
+                    elif days_until <= 7:
+                        earnings_warning = (
+                            f"\n⚠️ EARNINGS in {days_until} days ({earn_date}) — "
+                            f"research says avoid new entries within 3 days of earnings. "
+                            f"Wait for post-earnings reaction before buying."
+                        )
+            except Exception as exc:
+                print(f"[/deep {ticker}] earnings proximity check failed: {exc}")
+
             target_line = (
                 f"Analyst target: ${target:.2f}" if target else "Analyst target: n/a"
             )
@@ -3737,6 +3760,7 @@ def handle_deep(args, chat_id):
                     f"\n{format_buy_disqualifier_block(ticker, score, dqs)}\n\n"
                     f"Despite a {score}/100 momentum score, {ticker} does NOT "
                     f"qualify as a BUY due to the rule(s) above."
+                    f"{earnings_warning}"
                 )
                 send_telegram(dq_msg, chat_id, parse_mode=None)
             else:
@@ -3749,7 +3773,8 @@ def handle_deep(args, chat_id):
                 send_telegram(
                     f"{color} {ticker} — {signal}\n"
                     f"{stats_block}\n"
-                    f"{reason}",
+                    f"{reason}"
+                    f"{earnings_warning}",
                     chat_id,
                     parse_mode=None,
                 )
