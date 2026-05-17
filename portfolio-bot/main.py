@@ -5150,7 +5150,9 @@ def _scheduled_daily_watchlist_check():
                 f"Price: {price_str} | Target: {target_str} | Stop: {stop_str}\n"
                 f"RS vs SPY: {rs_str} | RVOL: {rvol_str}x\n"
                 f"Earnings: {earnings_str}\n"
-                f"Signal confirmed for {consecutive_days} consecutive days ✅",
+                f"Signal confirmed for {consecutive_days} consecutive days ✅\n"
+                f"Entry: place limit order at previous day's close at 10:00 AM ET\n"
+                f"Cancel if not filled by 11:00 AM ET",
                 chat_id,
                 parse_mode=None,
             )
