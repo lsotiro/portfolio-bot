@@ -3705,6 +3705,7 @@ def handle_deep(args, chat_id):
             earnings_warning = ""
             try:
                 nxt_earnings = get_next_earnings(ticker)
+                print(f"[/deep {ticker}] earnings check result: {nxt_earnings}")
                 if nxt_earnings is not None:
                     days_until = nxt_earnings["days_until"]
                     earn_date = nxt_earnings["report_date"].strftime("%b %d")
