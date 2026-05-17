@@ -3414,15 +3414,18 @@ def _handle_portfolio_inner(chat_id, scheduled=False):
                         f"${r['current']:.2f} ≤ stop ${r['stop']:.2f} "
                         f"(P&L {pl_pct_txt} from entry ${r['entry']:.2f})."
                     )
+                    action = "Action: place market order at open immediately — do not wait for a bounce"
                 else:
                     trigger = (
                         f"Momentum score {r['score']}/100 below 35 "
                         f"for 2 consecutive days — SELL confirmed."
                     )
+                    action = "Action: place market order at 10:00 AM ET tomorrow"
                 send_telegram(
                     f"🚨 SELL ALERT — {r['ticker']}\n"
                     f"{trigger}\n"
-                    f"Reason: {r['reason']}",
+                    f"Reason: {r['reason']}\n"
+                    f"{action}",
                     chat_id,
                     parse_mode=None,
                 )
@@ -4935,7 +4938,8 @@ def check_gap_down(chat_id=None):
             f"Pre-market price ${current:.2f} ≤ trailing stop "
             f"${stop_price:.2f} ({mode_txt}).\n"
             f"P&L from entry: {pl_pct:+.1f}%.\n"
-            f"Consider exiting at the open to protect capital.",
+            f"Consider exiting at the open to protect capital.\n"
+            f"Action: place market order at open immediately — do not wait for a bounce",
             chat_id,
             parse_mode=None,
         )
