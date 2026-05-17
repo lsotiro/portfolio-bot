@@ -5171,7 +5171,7 @@ schedule.every().day.at("07:30", "UTC").do(scheduled_recommendation_review)
 schedule.every().day.at("08:00", "UTC").do(scheduled_earnings_check)
 schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
 # Pre-market gap-down sweep — runs alongside the earnings/weekly sweep.
-schedule.every().day.at("08:00", "UTC").do(check_gap_down)
+schedule.every().day.at("04:00", "UTC").do(check_gap_down)
 schedule.every().day.at("08:30", "UTC").do(scheduled_health_check)
 # Daily portfolio delivery — time is user-configurable via /settings.
 # A per-minute poller fires scheduled_run() when the clock matches the
