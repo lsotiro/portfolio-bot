@@ -314,7 +314,7 @@ def score_momentum(ticker, hist=None, spy_hist=None, info=None,
     try:
         if hist is None:
             try:
-                hist = yf.Ticker(ticker).history(period="3mo")
+                hist = yf.Ticker(ticker).history(period="1y")
             except Exception as exc:
                 print(f"[momentum {ticker}] history fetch failed: {exc}")
                 hist = None
