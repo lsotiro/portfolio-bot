@@ -222,9 +222,9 @@ def _news_keyword_score(articles):
         return 10, f"0 positive, 0 negative ({len(articles)} articles, no signal words)"
     ratio = pos / total
     if ratio >= 0.7:
-        score = 20
+        score = 5
     elif ratio >= 0.4:
-        score = 10
+        score = 3
     else:
         score = 0
     return score, f"{pos} positive, {neg} negative"
