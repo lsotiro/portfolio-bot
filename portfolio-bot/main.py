@@ -3706,6 +3706,32 @@ def handle_deep(args, chat_id):
             try:
                 nxt_earnings = get_next_earnings(ticker)
                 print(f"[/deep {ticker}] earnings check result: {nxt_earnings}")
+
+                # Finnhub fallback when primary source returns nothing
+                if nxt_earnings is None and FINNHUB_API_KEY:
+                    try:
+                        today_str = datetime.utcnow().date().isoformat()
+                        future_str = (datetime.utcnow().date() + timedelta(days=7)).isoformat()
+                        fh_url = (
+                            f"https://finnhub.io/api/v1/calendar/earnings"
+                            f"?from={today_str}&to={future_str}"
+                            f"&symbol={ticker}&token={FINNHUB_API_KEY}"
+                        )
+                        fh_resp = requests.get(fh_url, timeout=5).json()
+                        fh_events = fh_resp.get("earningsCalendar") or []
+                        if fh_events:
+                            fh_date_str = fh_events[0].get("date", "")
+                            if fh_date_str:
+                                fh_date = datetime.strptime(fh_date_str, "%Y-%m-%d").date()
+                                days_until = (fh_date - datetime.utcnow().date()).days
+                                nxt_earnings = {"days_until": days_until, "report_date": fh_date}
+                                print(
+                                    f"[/deep {ticker}] Finnhub fallback earnings: "
+                                    f"{fh_date_str} ({days_until}d)"
+                                )
+                    except Exception as fh_exc:
+                        print(f"[/deep {ticker}] Finnhub earnings fallback failed: {fh_exc}")
+
                 if nxt_earnings is not None:
                     days_until = nxt_earnings["days_until"]
                     earn_date = nxt_earnings["report_date"].strftime("%b %d")
