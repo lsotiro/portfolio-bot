@@ -13,6 +13,8 @@ Commands you can send the bot:
   /settings                  view or change bot settings (delivery time, on/off)
     /settings delivery on|off   toggle automatic daily delivery
     /settings time HH:MM        set delivery time in UTC (e.g. /settings time 08:30)
+  /test_delivery             manually trigger the full scheduled_run() (same as the daily delivery)
+  /test_watchlist            manually trigger _scheduled_daily_watchlist_check()
 
 Signal engine — 100-point momentum score per stock:
   Price momentum (30) + RS vs SPY (20) + volume confirm (15)
@@ -3854,7 +3856,9 @@ def handle_start(chat_id):
         "`/review` — open recommendations + 4w/8w countdowns\n"
         "`/performance` — track record vs S&P 500\n"
         "`/market` — market status (open/closed, ET time, holiday check)\n"
-        "`/settings` — view/change delivery time and on/off toggle\n\n"
+        "`/settings` — view/change delivery time and on/off toggle\n"
+        "`/test_delivery` — manually trigger the daily delivery right now\n"
+        "`/test_watchlist` — manually trigger the watchlist alert check\n\n"
         "_Hard SELL rules:_\n"
         "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
         "_• Tightened to -3% from current when momentum score 35–49_\n"
@@ -3997,6 +4001,28 @@ def poll_telegram():
                             target=run_monthly_screen,
                             args=(chat_id,),
                             daemon=True,
+                        ).start()
+                    elif cmd == "/test_delivery":
+                        send_telegram(
+                            "Test delivery started — running full scheduled_run() now...",
+                            chat_id,
+                        )
+                        print("[test_delivery] manual trigger via Telegram command")
+                        Thread(
+                            target=scheduled_run,
+                            daemon=True,
+                            name="test-delivery",
+                        ).start()
+                    elif cmd == "/test_watchlist":
+                        send_telegram(
+                            "Test watchlist check started — running _scheduled_daily_watchlist_check() now...",
+                            chat_id,
+                        )
+                        print("[test_watchlist] manual trigger via Telegram command")
+                        Thread(
+                            target=_scheduled_daily_watchlist_check,
+                            daemon=True,
+                            name="test-watchlist",
                         ).start()
                     else:
                         send_telegram(
@@ -4904,6 +4930,11 @@ def _flexible_daily_delivery():
     now_utc = datetime.utcnow()
     current_hhmm = now_utc.strftime("%H:%M")
     today = now_utc.date()
+    print(
+        f"[daily-delivery] tick | now={current_hhmm} UTC | target={delivery_time} |"
+        f" last_delivery={_last_delivery_date} | today={today} |"
+        f" {'FIRE' if current_hhmm == delivery_time and _last_delivery_date != today else 'skip'}"
+    )
     if current_hhmm == delivery_time and _last_delivery_date != today:
         _last_delivery_date = today
         print(f"[daily-delivery] firing at {delivery_time} UTC")
@@ -5294,6 +5325,8 @@ if __name__ == "__main__":
 
     # ── Startup catch-up: if the bot restarted after the scheduled delivery
     # time and the morning report hasn't been sent yet today, fire it now.
+    # Only catches up between 06:00–20:00 UTC so late-night restarts don't
+    # trigger a spurious delivery in the middle of the night.
     _startup_settings = load_settings()
     if _startup_settings.get("daily_delivery", True) and is_trading_day():
         _delivery_time = _startup_settings.get("delivery_time_utc", "06:00")
@@ -5302,13 +5335,19 @@ if __name__ == "__main__":
         _delivery_hh, _delivery_mm = map(int, _delivery_time.split(":"))
         _delivery_minutes = _delivery_hh * 60 + _delivery_mm
         _current_minutes = _now_utc.hour * 60 + _now_utc.minute
-        if _current_minutes >= _delivery_minutes and _last_delivery_date != _today:
+        _catchup_ok = 6 * 60 <= _current_minutes <= 20 * 60  # only 06:00–20:00 UTC
+        if _current_minutes >= _delivery_minutes and _last_delivery_date != _today and _catchup_ok:
             _last_delivery_date = _today
             print(
                 f"[boot] past delivery time ({_delivery_time} UTC) with no delivery today"
                 " — running catch-up report"
             )
             Thread(target=scheduled_run, daemon=True, name="startup-catchup").start()
+        elif not _catchup_ok:
+            print(
+                f"[boot] outside catch-up window (current UTC hour={_now_utc.hour})"
+                " — skipping startup catch-up"
+            )
 
     # ── Main thread: run the schedule loop indefinitely
     while True:
