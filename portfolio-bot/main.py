@@ -4004,23 +4004,23 @@ def poll_telegram():
                         ).start()
                     elif cmd == "/test_delivery":
                         send_telegram(
-                            "Test delivery started — running full scheduled_run() now...",
+                            "Test delivery started — running full daily delivery now...",
                             chat_id,
                         )
-                        print("[test_delivery] manual trigger via Telegram command")
                         Thread(
-                            target=scheduled_run,
+                            target=handle_test_delivery,
+                            args=(chat_id,),
                             daemon=True,
                             name="test-delivery",
                         ).start()
                     elif cmd == "/test_watchlist":
                         send_telegram(
-                            "Test watchlist check started — running _scheduled_daily_watchlist_check() now...",
+                            "Test watchlist check started — running full watchlist alert check now...",
                             chat_id,
                         )
-                        print("[test_watchlist] manual trigger via Telegram command")
                         Thread(
-                            target=_scheduled_daily_watchlist_check,
+                            target=handle_test_watchlist,
+                            args=(chat_id,),
                             daemon=True,
                             name="test-watchlist",
                         ).start()
@@ -4915,6 +4915,18 @@ def scheduled_run():
     handle_portfolio(chat_id, scheduled=True)
 
 
+def handle_test_delivery(chat_id):
+    """Manual /test_delivery — runs the full daily delivery bypassing the trading-day guard."""
+    print("[test_delivery] manual trigger via Telegram command")
+    handle_portfolio(chat_id, scheduled=True)
+
+
+def handle_test_watchlist(chat_id):
+    """Manual /test_watchlist — runs the full watchlist check bypassing the trading-day guard."""
+    print("[test_watchlist] manual trigger via Telegram command")
+    _scheduled_daily_watchlist_check(_force=True)
+
+
 def _flexible_daily_delivery():
     """Runs every minute — fires ``scheduled_run`` exactly once per trading
     day when the clock matches the user-configured delivery_time_utc.
@@ -5187,9 +5199,9 @@ def _send_no_replacement(chat_id, top_score=None):
     _send_chunked("\n".join(parts), chat_id)
 
 
-def _scheduled_daily_watchlist_check():
+def _scheduled_daily_watchlist_check(_force=False):
     """Daily 08:00 UTC — score watchlist stocks and send Telegram BUY alerts."""
-    if _skip_if_not_trading_day("watchlist-check"):
+    if not _force and _skip_if_not_trading_day("watchlist-check"):
         return
     chat_id = recall_chat()
     if chat_id is None:
