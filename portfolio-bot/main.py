@@ -426,7 +426,7 @@ def save_json(path, data):
 # ---------------------------------------------------------------------------
 _SETTINGS_DEFAULTS = {
     "daily_delivery": True,        # send /portfolio automatically each day
-    "delivery_time_utc": "06:00",  # HH:MM UTC — when to send it
+    "delivery_time_utc": "14:00",  # HH:MM UTC — when to send it
     "timezone_display": "ET",      # label shown in market status lines
 }
 
