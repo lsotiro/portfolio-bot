@@ -4934,23 +4934,26 @@ def _flexible_daily_delivery():
     Using a per-minute poller lets the user change the delivery time via
     /settings without restarting the bot.
     """
-    global _last_delivery_date
-    settings = load_settings()
-    if not settings.get("daily_delivery", True):
-        return
-    delivery_time = settings.get("delivery_time_utc", "09:00")
-    now_utc = datetime.utcnow()
-    current_hhmm = now_utc.strftime("%H:%M")
-    today = now_utc.date()
-    print(
-        f"[daily-delivery] tick | now={current_hhmm} UTC | target={delivery_time} |"
-        f" last_delivery={_last_delivery_date} | today={today} |"
-        f" {'FIRE' if current_hhmm == delivery_time and _last_delivery_date != today else 'skip'}"
-    )
-    if current_hhmm == delivery_time and _last_delivery_date != today:
-        _last_delivery_date = today
-        print(f"[daily-delivery] firing at {delivery_time} UTC")
-        scheduled_run()
+    try:
+        global _last_delivery_date
+        settings = load_settings()
+        if not settings.get("daily_delivery", True):
+            return
+        delivery_time = settings.get("delivery_time_utc", "09:00")
+        now_utc = datetime.utcnow()
+        current_hhmm = now_utc.strftime("%H:%M")
+        today = now_utc.date()
+        print(
+            f"[daily-delivery] tick | now={current_hhmm} UTC | target={delivery_time} |"
+            f" last_delivery={_last_delivery_date} | today={today} |"
+            f" {'FIRE' if current_hhmm == delivery_time and _last_delivery_date != today else 'skip'}"
+        )
+        if current_hhmm == delivery_time and _last_delivery_date != today:
+            _last_delivery_date = today
+            print(f"[daily-delivery] firing at {delivery_time} UTC")
+            scheduled_run()
+    except Exception as exc:
+        print(f"[daily-delivery] unhandled error (scheduler kept alive): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -5262,18 +5265,18 @@ def _scheduled_daily_watchlist_check(_force=False):
             )
 
 
-schedule.every().day.at("04:30", "UTC").do(scheduled_recommendation_review)
-schedule.every().day.at("05:00", "UTC").do(scheduled_earnings_check)
-schedule.every().day.at("08:00", "UTC").do(scheduled_weekly_summary)  # Sundays only
+schedule.every().day.at("04:30", "UTC").do(lambda: Thread(target=scheduled_recommendation_review, daemon=True).start())
+schedule.every().day.at("05:00", "UTC").do(lambda: Thread(target=scheduled_earnings_check, daemon=True).start())
+schedule.every().day.at("08:00", "UTC").do(lambda: Thread(target=scheduled_weekly_summary, daemon=True).start())  # Sundays only
 # Pre-market gap-down sweep — runs alongside the earnings/weekly sweep.
-schedule.every().day.at("04:00", "UTC").do(check_gap_down)
-schedule.every().day.at("05:30", "UTC").do(scheduled_health_check)
+schedule.every().day.at("04:00", "UTC").do(lambda: Thread(target=check_gap_down, daemon=True).start())
+schedule.every().day.at("05:30", "UTC").do(lambda: Thread(target=scheduled_health_check, daemon=True).start())
 # Daily portfolio delivery — time is user-configurable via /settings.
 # A per-minute poller fires scheduled_run() when the clock matches the
 # configured delivery_time_utc, so time changes take effect immediately.
-schedule.every().minute.do(_flexible_daily_delivery)
-schedule.every().monday.at("07:00").do(run_weekly_scan)
-schedule.every().day.at("08:00").do(_scheduled_daily_watchlist_check)
+schedule.every().minute.do(lambda: Thread(target=_flexible_daily_delivery, daemon=True).start())
+schedule.every().monday.at("07:00").do(lambda: Thread(target=run_weekly_scan, daemon=True).start())
+schedule.every().day.at("08:00").do(lambda: Thread(target=_scheduled_daily_watchlist_check, daemon=True).start())
 
 
 # ---------------------------------------------------------------------------
