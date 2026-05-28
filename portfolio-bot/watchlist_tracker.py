@@ -25,6 +25,11 @@ def save_watchlist(watchlist):
     os.replace(tmp, WATCHLIST_FILE)
 
 
+def clear_watchlist():
+    """Overwrite watchlist_candidates.json with an empty dict."""
+    save_watchlist({})
+
+
 def add_to_watchlist(ticker, score):
     """Add a ticker to the watchlist with today's date and initial score.
 

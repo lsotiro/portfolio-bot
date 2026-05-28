@@ -68,7 +68,7 @@ import requests
 import schedule
 import yfinance as yf
 from flask import Flask
-from watchlist_tracker import add_to_watchlist, update_consecutive_days, get_buy_alerts, load_watchlist
+from watchlist_tracker import add_to_watchlist, clear_watchlist, update_consecutive_days, get_buy_alerts, load_watchlist
 from daily_watchlist_check import run_daily_check
 from momentum_engine import (
     score_momentum,
@@ -2155,7 +2155,10 @@ def run_weekly_scan():
 
     result = _quality_scan(tickers)
 
-    # Add all qualifying stocks (clean picks + disqualified) to the watchlist.
+    # Replace the watchlist with only this scan's results.
+    clear_watchlist()
+    print("[weekly-scan] watchlist cleared — populating from current scan")
+
     added = []
     for t, s, _d in result["qualifying"]:
         try:
