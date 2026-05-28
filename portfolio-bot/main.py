@@ -15,6 +15,7 @@ Commands you can send the bot:
     /settings time HH:MM        set delivery time in UTC (e.g. /settings time 08:30)
   /test_delivery             manually trigger the full scheduled_run() (same as the daily delivery)
   /test_watchlist            manually trigger _scheduled_daily_watchlist_check()
+  /reset_delivery            clear the delivery lock so the scheduler can fire again today
 
 Signal engine — 100-point momentum score per stock:
   Price momentum (30) + RS vs SPY (20) + volume confirm (15)
@@ -3858,7 +3859,8 @@ def handle_start(chat_id):
         "`/market` — market status (open/closed, ET time, holiday check)\n"
         "`/settings` — view/change delivery time and on/off toggle\n"
         "`/test_delivery` — manually trigger the daily delivery right now\n"
-        "`/test_watchlist` — manually trigger the watchlist alert check\n\n"
+        "`/test_watchlist` — manually trigger the watchlist alert check\n"
+        "`/reset_delivery` — clear the delivery lock so the scheduler can fire again today\n\n"
         "_Hard SELL rules:_\n"
         "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
         "_• Tightened to -3% from current when momentum score 35–49_\n"
@@ -4024,6 +4026,8 @@ def poll_telegram():
                             daemon=True,
                             name="test-watchlist",
                         ).start()
+                    elif cmd == "/reset_delivery":
+                        handle_reset_delivery(chat_id)
                     else:
                         send_telegram(
                             "Unknown command. Send /help for the list.", chat_id
@@ -4925,6 +4929,17 @@ def handle_test_watchlist(chat_id):
     """Manual /test_watchlist — runs the full watchlist check bypassing the trading-day guard."""
     print("[test_watchlist] manual trigger via Telegram command")
     _scheduled_daily_watchlist_check(_force=True)
+
+
+def handle_reset_delivery(chat_id):
+    """Manual /reset_delivery — clears _last_delivery_date so the scheduler can fire again today."""
+    global _last_delivery_date
+    _last_delivery_date = None
+    print("[reset_delivery] _last_delivery_date cleared")
+    send_telegram(
+        "Delivery lock cleared — the scheduler will fire again today when the clock matches your configured delivery time.",
+        chat_id,
+    )
 
 
 def _flexible_daily_delivery():
