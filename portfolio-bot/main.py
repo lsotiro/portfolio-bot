@@ -15,6 +15,7 @@ Commands you can send the bot:
     /settings time HH:MM        set delivery time in UTC (e.g. /settings time 08:30)
   /test_delivery             manually trigger the full scheduled_run() (same as the daily delivery)
   /test_watchlist            manually trigger _scheduled_daily_watchlist_check()
+  /test_weekly_scan          manually trigger run_weekly_scan()
   /reset_delivery            clear the delivery lock so the scheduler can fire again today
 
 Signal engine — 100-point momentum score per stock:
@@ -3866,6 +3867,7 @@ def handle_start(chat_id):
         "`/settings` — view/change delivery time and on/off toggle\n"
         "`/test_delivery` — manually trigger the daily delivery right now\n"
         "`/test_watchlist` — manually trigger the watchlist alert check\n"
+        "`/test_weekly_scan` — manually trigger the weekly scan\n"
         "`/reset_delivery` — clear the delivery lock so the scheduler can fire again today\n\n"
         "_Hard SELL rules:_\n"
         "_• Trailing stop loss from peak (-5% / -7% / -10% by ATR volatility)_\n"
@@ -4034,6 +4036,17 @@ def poll_telegram():
                         ).start()
                     elif cmd == "/reset_delivery":
                         handle_reset_delivery(chat_id)
+                    elif cmd == "/test_weekly_scan":
+                        send_telegram(
+                            "Weekly scan started — running now...",
+                            chat_id,
+                        )
+                        Thread(
+                            target=handle_test_weekly_scan,
+                            args=(chat_id,),
+                            daemon=True,
+                            name="test-weekly-scan",
+                        ).start()
                     else:
                         send_telegram(
                             "Unknown command. Send /help for the list.", chat_id
@@ -4935,6 +4948,12 @@ def handle_test_watchlist(chat_id):
     """Manual /test_watchlist — runs the full watchlist check bypassing the trading-day guard."""
     print("[test_watchlist] manual trigger via Telegram command")
     _scheduled_daily_watchlist_check(_force=True)
+
+
+def handle_test_weekly_scan(chat_id):
+    """Manual /test_weekly_scan — triggers run_weekly_scan immediately."""
+    print("[test_weekly_scan] manual trigger via Telegram command")
+    run_weekly_scan()
 
 
 def handle_reset_delivery(chat_id):
