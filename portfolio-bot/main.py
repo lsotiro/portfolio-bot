@@ -5327,6 +5327,27 @@ if __name__ == "__main__":
     os.makedirs(_DATA_DIR, exist_ok=True)
     print(f"[boot] data directory: {os.path.abspath(_DATA_DIR)}")
 
+    # ── One-time migration: copy JSON files from repo root → _DATA_DIR ───
+    # Runs only when DATA_DIR is set to somewhere other than ".".  Copies
+    # each file only if it doesn't already exist at the destination, so a
+    # live volume is never overwritten after the first deploy.
+    import shutil as _shutil
+    _MIGRATE_FILES = [
+        "portfolio.json", "cash.json", "monthly_picks.json",
+        "signal_log.json", "recommendations_log.json",
+        "last_chat.json", "bot_settings.json",
+    ]
+    if os.path.abspath(_DATA_DIR) != os.path.abspath("."):
+        for _fname in _MIGRATE_FILES:
+            _src = _fname                                  # repo root / CWD
+            _dst = os.path.join(_DATA_DIR, _fname)
+            if os.path.exists(_src) and not os.path.exists(_dst):
+                try:
+                    _shutil.copy2(_src, _dst)
+                    print(f"[boot] migrated {_fname} → {_dst}")
+                except Exception as _e:
+                    print(f"[boot] migration failed for {_fname}: {_e}")
+
     # ── PID-file guard: prevent two instances running simultaneously ──────
     # Replit restarts can leave a zombie process still holding the port and
     # the Telegram polling connection. Writing our PID to a lockfile and
