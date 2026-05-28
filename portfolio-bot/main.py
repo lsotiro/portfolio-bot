@@ -68,9 +68,7 @@ import requests
 import schedule
 import yfinance as yf
 from flask import Flask
-from watchlist import score_watchlist
 from watchlist_tracker import add_to_watchlist, update_consecutive_days, get_buy_alerts, load_watchlist
-from weekly_scanner import run_weekly_scan
 from daily_watchlist_check import run_daily_check
 from momentum_engine import (
     score_momentum,
@@ -1862,6 +1860,116 @@ def _get_quick_reasons(positions_data):
 
 
 # ---------------------------------------------------------------------------
+# Shared quality scan pipeline — used by /monthly and the weekly scheduler
+# ---------------------------------------------------------------------------
+def _quality_scan(tickers):
+    """Fundamental filter → momentum scoring → disqualification rules.
+
+    Both run_monthly_screen (/monthly Telegram output) and run_weekly_scan
+    (Monday watchlist population) call this so they operate on exactly the
+    same quality bar: revenue growth >15%, profit margin >15%, ROE >15%,
+    forward PE <25, earnings growth >10%, recommendationMean <2.0, AND
+    momentum score >= 65.
+
+    Returns a dict:
+      fundamentals_map   – {ticker: snap} for all tickers where data landed
+      cand_fundamentals  – {ticker: snap} for tickers that passed passes_buy_screen
+      basic_candidates   – list of fund snaps that passed passes_buy_screen
+      momentum_map       – {ticker: (score, details)} after sell-signal exclusions
+      ranked             – all (ticker, score, details) sorted by score desc
+      qualifying         – ranked entries with score >= 65
+      picks              – qualifying with no disqualifiers (clean buy entries)
+      disqualified       – [(ticker, score, details, dq_list)] pass quality bar
+                           but currently not ideal entry (overextended, etc.)
+    """
+    fundamentals_map = fetch_fundamentals_bulk(tickers)
+    print(
+        f"[scan] fetched fundamentals for {len(fundamentals_map)}"
+        f" / {len(tickers)} tickers"
+    )
+
+    basic_candidates = [f for f in fundamentals_map.values() if passes_buy_screen(f)]
+    print(f"[scan] {len(basic_candidates)} stocks pass the fundamental filter")
+
+    if not basic_candidates:
+        return {
+            "fundamentals_map": fundamentals_map,
+            "cand_fundamentals": {},
+            "basic_candidates": [],
+            "momentum_map": {},
+            "ranked": [],
+            "qualifying": [],
+            "picks": [],
+            "disqualified": [],
+        }
+
+    cand_tickers = [c["ticker"] for c in basic_candidates]
+    cand_fundamentals = {c["ticker"]: c for c in basic_candidates}
+
+    news_map = fetch_news_bulk(cand_tickers, days=7)
+    print(
+        f"[scan] fetched news for {sum(1 for v in news_map.values() if v)}"
+        f" / {len(cand_tickers)} candidates"
+    )
+
+    momentum_map = score_momentum_bulk(
+        cand_tickers,
+        fundamentals=cand_fundamentals,
+        news_map=news_map,
+    )
+    print(f"[scan] scored momentum for {len(momentum_map)} candidates")
+
+    # Exclude tickers with a recent SELL signal.
+    signal_log = load_signal_log()
+    today_date = datetime.utcnow().date()
+
+    def _had_recent_sell(ticker):
+        entry = signal_log.get(ticker)
+        if not entry:
+            return False
+        date_str = entry.get("last_sell_signal_date", "")
+        try:
+            d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            return (today_date - d).days <= SELL_SIGNAL_BLACKOUT_DAYS
+        except Exception:
+            return False
+
+    pre_count = len(momentum_map)
+    momentum_map = {t: v for t, v in momentum_map.items() if not _had_recent_sell(t)}
+    excluded = pre_count - len(momentum_map)
+    if excluded:
+        print(f"[scan] excluded {excluded} ticker(s) with recent SELL signal")
+
+    ranked = sorted(
+        ((t, s, d) for t, (s, d) in momentum_map.items() if s is not None),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    qualifying = [r for r in ranked if r[1] >= 65]
+
+    picks = []
+    disqualified = []
+    for t, s, d in qualifying:
+        fund = cand_fundamentals.get(t, {}) or {}
+        dqs = check_buy_disqualifiers(t, s, d, fund)
+        if dqs:
+            disqualified.append((t, s, d, dqs))
+        else:
+            picks.append((t, s, d))
+
+    return {
+        "fundamentals_map": fundamentals_map,
+        "cand_fundamentals": cand_fundamentals,
+        "basic_candidates": basic_candidates,
+        "momentum_map": momentum_map,
+        "ranked": ranked,
+        "qualifying": qualifying,
+        "picks": picks,
+        "disqualified": disqualified,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Monthly buy screen — used by /monthly
 # ---------------------------------------------------------------------------
 def run_monthly_screen(chat_id):
@@ -1903,86 +2011,22 @@ def run_monthly_screen(chat_id):
     )
     print(f"[monthly] {universe_line}")
 
-    fundamentals_map = fetch_fundamentals_bulk(tickers)
-    print(
-        f"[monthly] fetched fundamentals for {len(fundamentals_map)}"
-        f" / {len(tickers)} tickers"
-    )
-
-    basic_candidates = [
-        f for f in fundamentals_map.values() if passes_buy_screen(f)
-    ]
-    print(
-        f"[monthly] {len(basic_candidates)} stocks pass the hard fundamental "
-        f"filter"
-    )
-    if not basic_candidates:
+    result = _quality_scan(tickers)
+    if not result["basic_candidates"]:
         send_telegram(
             f"*Monthly Buy Screen*\n_{universe_line}_\n\n"
             "No stocks passed the fundamental filter this month.",
             chat_id,
         )
         return
-
-    cand_tickers = [c["ticker"] for c in basic_candidates]
-    cand_fundamentals = {c["ticker"]: c for c in basic_candidates}
-
-    # Pull 7-day news in bulk so the keyword-based news component of the
-    # momentum score has fresh signal without per-ticker re-fetching.
-    news_map = fetch_news_bulk(cand_tickers, days=7)
-    print(
-        f"[monthly] fetched news for {sum(1 for v in news_map.values() if v)}"
-        f" / {len(cand_tickers)} candidates"
-    )
-
-    momentum_map = score_momentum_bulk(
-        cand_tickers,
-        fundamentals=cand_fundamentals,
-        news_map=news_map,
-    )
-    print(f"[monthly] scored momentum for {len(momentum_map)} candidates")
-
-    # ── Filter: exclude tickers with a SELL signal in the last 7 days ──
-    signal_log = load_signal_log()
-    today_date = datetime.utcnow().date()
-    def _had_recent_sell(ticker):
-        entry = signal_log.get(ticker)
-        if not entry:
-            return False
-        date_str = entry.get("last_sell_signal_date", "")
-        try:
-            d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
-            return (today_date - d).days <= SELL_SIGNAL_BLACKOUT_DAYS
-        except Exception:
-            return False
-
-    pre_filter_count = len(momentum_map)
-    momentum_map = {t: v for t, v in momentum_map.items()
-                    if not _had_recent_sell(t)}
-    excluded = pre_filter_count - len(momentum_map)
-    if excluded:
-        print(f"[monthly] excluded {excluded} ticker(s) with recent SELL signal")
-
-    # Rank by score descending, take only those ≥ 65 (BUY threshold), top 2.
-    ranked = sorted(
-        ((t, s, d) for t, (s, d) in momentum_map.items() if s is not None),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    qualifying = [r for r in ranked if r[1] >= 65]
-
-    # Apply hard disqualification rules — clean picks go to BUY section,
-    # disqualified ones are shown separately with reasons.
-    picks = []
-    disqualified_entries = []   # list of (ticker, score, details, dq_list)
-    for t, s, d in qualifying:
-        fund = cand_fundamentals.get(t, {}) or {}
-        dqs = check_buy_disqualifiers(t, s, d, fund)
-        if dqs:
-            disqualified_entries.append((t, s, d, dqs))
-        else:
-            if len(picks) < 2:
-                picks.append((t, s, d))
+    cand_fundamentals    = result["cand_fundamentals"]
+    fundamentals_map     = result["fundamentals_map"]
+    basic_candidates     = result["basic_candidates"]
+    momentum_map         = result["momentum_map"]
+    ranked               = result["ranked"]
+    qualifying           = result["qualifying"]
+    picks                = result["picks"][:2]       # /monthly shows top 2 clean picks
+    disqualified_entries = result["disqualified"]
 
     if not picks and not disqualified_entries:
         top_score = ranked[0][1] if ranked else 0
@@ -2092,6 +2136,48 @@ def run_monthly_screen(chat_id):
         print(f"[monthly] recorded picks: {[e['ticker'] for e in parsed_for_log]}")
     except Exception as exc:
         print(f"[monthly] picks logging failed: {exc}")
+
+
+def run_weekly_scan():
+    """Monday automated scan — same fundamental+momentum pipeline as /monthly.
+
+    Adds every stock that passes the quality bar (fundamental filter + score
+    >= 65) to the watchlist, including those flagged by disqualification rules
+    (e.g. overextended or near target). They are still quality names worth
+    monitoring for a better entry point.
+    """
+    print("[weekly-scan] starting quality scan (S&P 500 + Nasdaq 100)...")
+    tickers, sp500_n, ndq100_n, _ = get_screening_universe()
+    print(
+        f"[weekly-scan] universe: {len(tickers)} tickers "
+        f"({sp500_n} S&P 500 + {ndq100_n} Nasdaq 100)"
+    )
+
+    result = _quality_scan(tickers)
+
+    # Add all qualifying stocks (clean picks + disqualified) to the watchlist.
+    added = []
+    for t, s, _d in result["qualifying"]:
+        try:
+            add_to_watchlist(t, s)
+            added.append((t, s))
+        except Exception as exc:
+            print(f"[weekly-scan] failed to add {t} to watchlist: {exc}")
+
+    print(
+        f"[weekly-scan] done — {len(result['basic_candidates'])} passed "
+        f"fundamental filter, {len(result['qualifying'])} scored >= 65, "
+        f"{len(added)} added/updated in watchlist"
+    )
+    return {
+        "sp500_count": sp500_n,
+        "ndq100_count": ndq100_n,
+        "universe_count": len(tickers),
+        "basic_candidates_count": len(result["basic_candidates"]),
+        "scored_count": len(result["qualifying"]),
+        "added_count": len(added),
+        "added_tickers": added,
+    }
 
 
 # ===========================================================================

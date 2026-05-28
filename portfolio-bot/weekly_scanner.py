@@ -1,8 +1,12 @@
+"""Weekly scanner — ticker-fetch utilities.
+
+run_weekly_scan() has moved to main.py and now uses the same
+_quality_scan() pipeline as /monthly (fundamental filter + momentum
+scoring + disqualification rules) so both entry points share one
+quality bar.
+"""
 import re
 import urllib.request
-
-from watchlist import score_watchlist
-from watchlist_tracker import add_to_watchlist
 
 _SP500_CSV_URL = (
     "https://raw.githubusercontent.com/datasets/"
@@ -52,62 +56,3 @@ def _fetch_csv_tickers(url, column_hint=None):
         if _TICKER_RE.match(raw):
             tickers.append(raw)
     return tickers
-
-
-def run_weekly_scan():
-    """Scan S&P 500 + Nasdaq 100, score all tickers, add qualifiers to watchlist.
-
-    Returns a summary dict:
-      sp500_count      – tickers fetched from S&P 500 list
-      ndq100_count     – tickers fetched from Nasdaq 100 list
-      universe_count   – deduplicated combined universe
-      scored_count     – tickers for which a momentum score was computed
-      added_count      – stocks added to the watchlist (score >= 65)
-      added_tickers    – list of (ticker, score) for the new additions
-    """
-    print("[weekly-scan] fetching S&P 500 tickers...")
-    try:
-        sp500 = _fetch_csv_tickers(_SP500_CSV_URL)
-        print(f"[weekly-scan] S&P 500: {len(sp500)} tickers")
-    except Exception as exc:
-        print(f"[weekly-scan] S&P 500 fetch failed: {exc}")
-        sp500 = []
-
-    print("[weekly-scan] fetching Nasdaq 100 tickers...")
-    try:
-        ndq100 = _fetch_csv_tickers(_NDQ100_CSV_URL)
-        print(f"[weekly-scan] Nasdaq 100: {len(ndq100)} tickers")
-    except Exception as exc:
-        print(f"[weekly-scan] Nasdaq 100 fetch failed: {exc}")
-        ndq100 = []
-
-    # Deduplicate while preserving S&P 500 ordering first.
-    seen = set(sp500)
-    universe = sp500 + [t for t in ndq100 if t not in seen]
-    print(f"[weekly-scan] combined universe: {len(universe)} tickers")
-
-    print("[weekly-scan] scoring tickers (this takes several minutes)...")
-    qualifying = score_watchlist(universe)
-    print(f"[weekly-scan] {len(qualifying)} tickers scored >= 65")
-
-    added = []
-    for ticker, score, _details in qualifying:
-        try:
-            add_to_watchlist(ticker, score)
-            added.append((ticker, score))
-        except Exception as exc:
-            print(f"[weekly-scan] failed to add {ticker} to watchlist: {exc}")
-
-    summary = {
-        "sp500_count": len(sp500),
-        "ndq100_count": len(ndq100),
-        "universe_count": len(universe),
-        "scored_count": len(qualifying),
-        "added_count": len(added),
-        "added_tickers": added,
-    }
-    print(
-        f"[weekly-scan] done — scanned {len(universe)}, "
-        f"scored {len(qualifying)} >= 65, added {len(added)} to watchlist"
-    )
-    return summary
