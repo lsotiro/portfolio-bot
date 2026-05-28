@@ -105,7 +105,13 @@ MAX_POSITIONS_PER_SECTOR = 3
 # Cash management — initial cash, idle threshold, treasury suggestion.
 INITIAL_CASH = 5000.0
 IDLE_CASH_THRESHOLD = 500.0
-CASH_FILE = "cash.json"
+
+# Persistent data directory — set DATA_DIR env var to a Railway volume
+# mount path (e.g. /data) so JSON state files survive redeploys.
+# Falls back to "." (repo root / CWD) for local dev with no env var set.
+_DATA_DIR = os.environ.get("DATA_DIR", ".")
+
+CASH_FILE = os.path.join(_DATA_DIR, "cash.json")
 
 # Immediate rescan-after-exit: wait this long before scanning for a
 # replacement (lets the user see the sell alert first, and lets the
@@ -257,12 +263,12 @@ ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 # Free-tier AV is 5 requests/minute. Space calls 13s apart to stay safe.
 ALPHA_VANTAGE_MIN_INTERVAL_SEC = 13.0
 
-PORTFOLIO_FILE = "portfolio.json"   # where positions are stored
-LAST_CHAT_FILE = "last_chat.json"   # remembers chat for scheduled reports
-RECS_LOG_FILE = "recommendations_log.json"   # feedback-loop history
-MONTHLY_PICKS_FILE = "monthly_picks.json"    # {ticker: ISO-date} of last monthly rec
-SIGNAL_LOG_FILE = "signal_log.json"          # {ticker: last_sell_signal_date} log
-SETTINGS_FILE = "bot_settings.json"          # user-configurable bot settings
+PORTFOLIO_FILE     = os.path.join(_DATA_DIR, "portfolio.json")         # where positions are stored
+LAST_CHAT_FILE     = os.path.join(_DATA_DIR, "last_chat.json")          # remembers chat for scheduled reports
+RECS_LOG_FILE      = os.path.join(_DATA_DIR, "recommendations_log.json") # feedback-loop history
+MONTHLY_PICKS_FILE = os.path.join(_DATA_DIR, "monthly_picks.json")      # {ticker: ISO-date} of last monthly rec
+SIGNAL_LOG_FILE    = os.path.join(_DATA_DIR, "signal_log.json")          # {ticker: last_sell_signal_date} log
+SETTINGS_FILE      = os.path.join(_DATA_DIR, "bot_settings.json")        # user-configurable bot settings
 
 # Review windows for recommendation tracking (calendar days).
 REVIEW_4W_DAYS = 28
@@ -5298,6 +5304,10 @@ schedule.every().day.at("08:00").do(lambda: Thread(target=_scheduled_daily_watch
 # Boot everything (only when run as a script, NOT when imported)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # ── Ensure the data directory exists (Railway volume may not pre-create it)
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    print(f"[boot] data directory: {os.path.abspath(_DATA_DIR)}")
+
     # ── PID-file guard: prevent two instances running simultaneously ──────
     # Replit restarts can leave a zombie process still holding the port and
     # the Telegram polling connection. Writing our PID to a lockfile and

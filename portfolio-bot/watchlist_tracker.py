@@ -2,7 +2,7 @@ import json
 import os
 from datetime import datetime
 
-WATCHLIST_FILE = "watchlist_candidates.json"
+WATCHLIST_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "watchlist_candidates.json")
 
 
 def _today():
