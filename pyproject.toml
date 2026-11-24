@@ -1,7 +1,7 @@
 [project]
-name = "repl-nix-workspace"
+name = "portfolio-bot"
 version = "0.1.0"
-description = "Add your description here"
+description = "Momentum portfolio bot with Telegram alerts"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.97.0",

@@ -55,7 +55,7 @@ The bot uses a **worker** process (not a web server), so no port binding is need
 
 ## Data files
 
-The bot stores state in JSON files in the project root:
+The bot stores state as JSON files in the directory set by the `DATA_DIR` env var (a Railway volume mounted at `/data`). These files are never committed to Git:
 
 | File | Contents |
 |---|---|
@@ -69,8 +69,12 @@ The bot stores state in JSON files in the project root:
 
 ```
 portfolio-bot/
-  main.py          # The entire bot (5100+ lines)
+  main.py                  # The bot: commands, scans, scheduler
+  momentum_engine.py       # 0-100 momentum scoring
+  watchlist_tracker.py     # Watchlist storage and streaks
+  daily_watchlist_check.py # Daily rescoring and BUY alerts
   dashboard.py     # Web dashboard (port 8082)
-  requirements.txt # Python dependencies
+  requirements.txt         # Python dependencies
+pyproject.toml, uv.lock    # Dependencies used by Railway's build
 Procfile           # Railway/Heroku worker definition
 ```
